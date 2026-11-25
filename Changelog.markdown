@@ -1,3 +1,13 @@
+# diverge fork (unreleased, based on upstream v1.2.7)
+
+* build with Nix as a flake (haskell-flake) on nixpkgs-unstable's default GHC (9.10); remove niv, `release.nix`, `default.nix` and `shell.nix`
+* export `haskellFlakeProjectModules.output` so haskell-flake projects can depend on project-m36 with its dependency settings
+* accept streamly 0.10 and 0.11 (`streamly >= 0.10.1 && < 0.12`, `curryer-rpc >= 0.5.1 && < 0.6`) via a small compatibility module, so nixpkgs' versions can be used
+* replace blanket jailbreaks/`allow-newer` with loosening only the third-party upper bounds that are actually too tight
+* macOS: read memory statistics with `sysctl` instead of spawning `memory_pressure` on every query; fixes queries failing when `/usr/bin` is not on `PATH` and the free-memory estimate on 16 KiB-page (Apple Silicon) machines
+* drop `-fexternal-interpreter` from the library, which made GHC 9.10 panic while running Template Haskell
+* run the full test suite in the Nix build (previously disabled)
+
 # ? (v1.2.7)
 
 * upgrade to streamly 0.11.1 along with curryer-rpc 0.5.2

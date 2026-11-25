@@ -1,25 +1,31 @@
 # Ξ Project:M36 Relational Algebra Engine
 
-[![Haskell Programming Language](https://img.shields.io/badge/language-Haskell-blue.svg)](https://www.haskell.org)
-[![Public Domain](https://img.shields.io/badge/license-Public%20Domain-brightgreen.svg)](http://unlicense.org)
-[![Hackage](https://img.shields.io/hackage/v/project-m36.svg)](http://hackage.haskell.org/package/project-m36)
-[![Hackage dependency status](https://img.shields.io/hackage-deps/v/project-m36.svg)](http://packdeps.haskellers.com/feed?needle=project-m36)
-[![Github Workflow status](https://github.com/agentm/project-m36/workflows/CI/badge.svg)](https://github.com/agentm/project-m36/actions?query=workflow%3ACI)
-
+[![CI](https://github.com/diverge-Inc/m36/actions/workflows/ci.yaml/badge.svg)](https://github.com/diverge-Inc/m36/actions/workflows/ci.yaml)
 
 *Software can always be made faster, but rarely can it be made more correct.*
+
+> [!NOTE]
+> This is diverge's fork of [agentm/project-m36](https://github.com/agentm/project-m36). It tracks upstream and differs mainly in packaging: it is a Nix flake built on nixpkgs' default GHC (currently 9.10), with dependency bounds aligned to the versions in nixpkgs. See [Changelog](Changelog.markdown) for the fork-specific changes.
 
 ## Introduction
 
 Project:M36 implements a relational algebra engine as inspired by the writings of Chris Date. Project:M36 supports both SQL and TutorialD interactive access.
 
-## Quick Install
+## Quick Start
 
-Project:M36 can be downloaded and run via docker, which supports Windows 10+, macOS, and Linux.
+With [Nix](https://nixos.org/download/) (flakes enabled), run the [TutorialD](docs/tutd_tutorial.markdown) command line interface directly:
 
-Run `docker run -it projectm36/project-m36 tutd` to start the [TutorialD](docs/tutd_tutorial.markdown) command line interface.
+```
+nix run github:diverge-Inc/m36
+```
 
-Run `docker run -it projectm36/project-m36 sqlegacy` to start the [SQLegacy](docs/sqlegacy.markdown) (SQL dialect) command line interface.
+or the [SQLegacy](docs/sqlegacy.markdown) (SQL dialect) interface:
+
+```
+nix run github:diverge-Inc/m36#sqlegacy
+```
+
+Upstream also publishes a Docker image (`docker run -it projectm36/project-m36 tutd`) and releases on [Hackage](https://hackage.haskell.org/package/project-m36); those are built from upstream, not from this fork.
 
 ## Description
 
@@ -31,7 +37,37 @@ Project:M36 is written entirely in the [Haskell programming language](https://ww
 
 ## Sample Session
 
-[![asciicast](https://asciinema.org/a/3syu35c8cydm403292a74l1n5.png)](https://asciinema.org/a/3syu35c8cydm403292a74l1n5)
+```
+$ nix run github:diverge-Inc/m36
+Project:M36 TutorialD Interpreter 1.2.7
+Type ":help" for more information.
+TutorialD (master/main): :importexample cjdate
+TutorialD (master/main): :showexpr s where gt(@status,15)
+┌──────────┬────────┬───────────┬───────────────┐
+│city::Text│s#::Text│sname::Text│status::Integer│
+├──────────┼────────┼───────────┼───────────────┤
+│"London"  │"S4"    │"Clark"    │20             │
+│"Paris"   │"S3"    │"Blake"    │30             │
+│"Athens"  │"S5"    │"Adams"    │30             │
+│"London"  │"S1"    │"Smith"    │20             │
+└──────────┴────────┴───────────┴───────────────┘
+TutorialD (master/main): :showexpr ((s join sp) where city="London"){sname,p#,qty}
+┌────────┬────────────┬───────────┐
+│p#::Text│qty::Integer│sname::Text│
+├────────┼────────────┼───────────┤
+│"P1"    │300         │"Smith"    │
+│"P5"    │400         │"Clark"    │
+│"P2"    │200         │"Smith"    │
+│"P6"    │100         │"Smith"    │
+│"P4"    │300         │"Clark"    │
+│"P2"    │200         │"Clark"    │
+│"P4"    │200         │"Smith"    │
+│"P5"    │100         │"Smith"    │
+│"P3"    │400         │"Smith"    │
+└────────┴────────────┴───────────┘
+```
+
+Relations are sets, so tuple order is not significant. The [15 Minute Tutorial](docs/15_minute_tutorial.markdown) walks through more.
 
 ## Use-Cases
 
@@ -43,6 +79,8 @@ Project:M36 supports multiple frontends which target different audiences.
 * use Project:M36 as a native Haskell database backend
 
 ## Community
+
+These are upstream's community resources.
 
 * [TutorialD for SQL Developers](https://www.udemy.com/course/tutoriald-for-sql-developers/)
   * ask in IRC channel for discount code to get free access
@@ -72,7 +110,7 @@ Project:M36 supports multiple frontends which target different audiences.
 1. [ACID Database Properties](docs/acid_assessment.markdown)
 1. [On NULL (in SQL)](docs/on_null.markdown)
 1. [Reaching "Out of the Tarpit" with Project:M36](docs/reaching_out_of_the_tarpit.markdown)
-1. [An Architecture for Data Independence](docs/data_independence.markdown)'
+1. [An Architecture for Data Independence](docs/data_independence.markdown)
 
 
 ### SQL Support
@@ -96,7 +134,7 @@ Project:M36 supports multiple frontends which target different audiences.
 1. [Trans-Graph Relational Expressions](docs/transgraphrelationalexpr.markdown)
 1. [Isomorphic Schemas](docs/isomorphic_schemas.markdown)
 1. [Replication](docs/replication.markdown)
-1. [Basic Operator Benchmarks](https://rawgit.com/agentm/project-m36/master/docs/basic_benchmarks.html)
+1. [Basic Operator Benchmarks](docs/basic_benchmarks.html)
 1. [Merkle Transaction Hashes](docs/merkle_transaction_graph.markdown)
 1. [Handling DDL Changes](docs/Handling_DDL_Changes.markdown)
 1. [Importing a Haskell Module](docs/import_haskell_module.markdown)
@@ -110,7 +148,7 @@ Project:M36 supports multiple frontends which target different audiences.
 
 ## Development
 
-Project:M36 is developed in Haskell and compiled with GHC 9.2 or later.
+Project:M36 is developed in Haskell. Upstream supports GHC 9.4 – 9.10 via cabal or stack (see [Developer Setup](docs/dev_setup.markdown)); this fork is built and tested with Nix on nixpkgs' default GHC.
 
 ### Nix flake
 
@@ -145,7 +183,7 @@ haskellProjects.default = {
 
 Without haskell-flake, use `legacyPackages.${system}.haskellPackages` (nixpkgs' `haskellPackages` with `project-m36` and the same overrides) for the library, or `overlays.default`, which adds the executables as `pkgs.project-m36`.
 
-The dependency overrides on top of nixpkgs live in `nix/dependencies.nix`. When updating nixpkgs (`nix flake update`), check whether any of them can be dropped.
+Dependency policy: Haskell dependencies come from nixpkgs as-is, and the bounds in `project-m36.cabal` are written to accept those versions (for example, streamly 0.10 and 0.11 are both supported). `nix/dependencies.nix` only contains what third-party packages need to build on nixpkgs: a few loosened upper bounds (no blanket jailbreaks), one source patch, and a pinned TLS stack that `curryer-rpc` actually requires. `cabal.project` mirrors the same loosened bounds for non-Nix builds. When updating nixpkgs (`nix flake update`), check whether any of these can be dropped.
 
 ## Related Projects
 
