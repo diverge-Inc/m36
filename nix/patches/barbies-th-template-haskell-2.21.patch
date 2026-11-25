@@ -1,0 +1,11 @@
+--- a/src/Barbies/TH.hs
++++ b/src/Barbies/TH.hs
+@@ -258,7 +258,7 @@
+         [ (strat, pure t) | (_, DerivClause strat preds) <- classes', t <- preds ]
+       return $ DataD [] dataName
+ #if MIN_VERSION_template_haskell(2,17,0)
+-        (tvbs ++ [PlainTV nSwitch (), KindedTV nWrap () (AppT (AppT ArrowT StarT) StarT)])
++        (tvbs ++ [PlainTV nSwitch BndrReq, KindedTV nWrap BndrReq (AppT (AppT ArrowT StarT) StarT)])
+ #else
+         (tvbs ++ [PlainTV nSwitch, KindedTV nWrap (AppT (AppT ArrowT StarT) StarT)])
+ #endif

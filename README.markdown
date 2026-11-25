@@ -112,6 +112,41 @@ Project:M36 supports multiple frontends which target different audiences.
 
 Project:M36 is developed in Haskell and compiled with GHC 9.2 or later.
 
+### Nix flake
+
+This repository is a Nix flake built with [haskell-flake](https://github.com/srid/haskell-flake). It follows the default GHC of nixpkgs-unstable (`pkgs.haskellPackages`, currently GHC 9.10), so most dependencies and `haskell-language-server` come from the public binary cache.
+
+Development environment (GHC with all dependencies, `cabal-install`, `haskell-language-server`, `ghcid`):
+
+```
+nix develop            # or `direnv allow` to load it automatically via .envrc
+cabal build
+```
+
+Run or build without cloning:
+
+```
+nix run github:diverge-Inc/m36            # tutd
+nix run github:diverge-Inc/m36#project-m36-server
+nix build github:diverge-Inc/m36          # library and executables (runs the test suites)
+```
+
+Use it from a haskell-flake project. Importing the exported project module brings in `project-m36` together with the dependency overrides it needs:
+
+```nix
+# flake.nix
+inputs.project-m36.url = "github:diverge-Inc/m36";
+
+# perSystem
+haskellProjects.default = {
+  imports = [ inputs.project-m36.haskellFlakeProjectModules.output ];
+};
+```
+
+Without haskell-flake, use `legacyPackages.${system}.haskellPackages` (nixpkgs' `haskellPackages` with `project-m36` and the same overrides) for the library, or `overlays.default`, which adds the executables as `pkgs.project-m36`.
+
+The dependency overrides on top of nixpkgs live in `nix/dependencies.nix`. When updating nixpkgs (`nix flake update`), check whether any of them can be dropped.
+
 ## Related Projects
 
 * [The Third Manifesto](http://thethirdmanifesto.com/): the philosophical basis for relational algebra engines

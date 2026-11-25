@@ -260,8 +260,8 @@ Library
       Other-Modules: ProjectM36.Win32Handle
     else
       --219-  too many exported symbols under Windows and GHC 8.4
-      GHC-Options: -rdynamic -fexternal-interpreter
-      C-sources: cbits/DirectoryFsync.c, cbits/darwin_statfs.c
+      GHC-Options: -rdynamic
+      C-sources: cbits/DirectoryFsync.c, cbits/darwin_statfs.c, cbits/darwin_memory.c
       Build-Depends: unix
     if os(linux)
       Build-Depends: linux-xattr

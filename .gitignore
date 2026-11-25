@@ -22,5 +22,6 @@ juyter/dist
 .ipynb_checkpoints
 project-m36.nix
 stack.yaml
-release.nix
-haddock_hackage.*/
+haddock_hackage.*/.direnv/
+result
+result-*

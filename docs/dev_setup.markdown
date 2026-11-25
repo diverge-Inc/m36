@@ -3,6 +3,10 @@
 Project:M36 is developed in Haskell with GHC 9.2+ and stack or cabal. Project:M36 includes server and client executables, a test suite, and example programs. See [project-m36.cabal](https://github.com/agentm/project-m36/blob/master/project-m36.cabal) for the available options.
 
 
+## Nix
+
+The repository is a Nix flake. `nix develop` enters a shell with GHC, all Haskell dependencies, `cabal-install`, `haskell-language-server` and `ghcid`; then use `cabal` as usual. `nix build` builds the library and executables and runs the test suites. See the "Nix flake" section of the README for details.
+
 ## cabal
 
 Use [`ghcup`](https://www.haskell.org/ghcup/) to install GHC and `cabal` to build and run `tutd`.

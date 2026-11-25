@@ -1,11 +1,13 @@
-#if defined(mingw32_HOST_OS)
+#if defined(mingw32_HOST_OS) || defined(darwin_HOST_OS)
 {-# LANGUAGE ForeignFunctionInterface #-}
 #endif
 module ProjectM36.SystemMemory where
 import Data.Int (Int64)
-#if defined(darwin_HOST_OS)  
-import System.Process (readProcess)
-import qualified Control.Exception as Exc
+#if defined(darwin_HOST_OS)
+import Foreign.C.Types (CInt(..))
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (Ptr)
+import Foreign.Storable (peek)
 import Text.Megaparsec
 import Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
@@ -22,6 +24,7 @@ import Data.Void
 #endif
 
 -- keep the parsers separate and compiling on all platforms so that we can test the parsers without waiting on macos CI runs
+-- The darwin implementation now reads sysctl directly (cbits/darwin_memory.c); these parsers are kept for the tests.
 -- | Parse memory_pressure output to extract free pages and total memory.
 parseMemoryPressureFreeMem :: Parsec Void String MemoryStats
 parseMemoryPressureFreeMem = do
@@ -69,6 +72,15 @@ data MEMORYSTATUSEX = MEMORYSTATUSEX
 foreign import ccall "GlobalMemoryStatusEx" c_GlobalMemoryStatusEx :: Ptr MEMORYSTATUSEX -> IO ()
 #endif
 
+#if defined(darwin_HOST_OS)
+-- see cbits/darwin_memory.c
+foreign import ccall unsafe "pm36DarwinMemoryStats"
+  c_pm36DarwinMemoryStats :: Ptr Int64 -> Ptr Int64 -> IO CInt
+
+foreign import ccall unsafe "pm36DarwinMemoryFreePercentage"
+  c_pm36DarwinMemoryFreePercentage :: IO CInt
+#endif
+
 type FreeMemBytes = Int64
 type TotalMemBytes = Int64
 type MemoryStats = (FreeMemBytes, TotalMemBytes)
@@ -84,13 +96,15 @@ getMemoryStats = do
         memStatus' <- peek ptr
         return $ Right (fromIntegral (ullAvailPhys memStatus'), fromIntegral (ullTotalPhys memStatus'))
 #elif defined(darwin_HOST_OS)
-  eres <- Exc.try (readProcess "memory_pressure" [] "") :: IO (Either IOError String)
-  case eres of
-    Left err -> pure (Left (Exc.displayException err))
-    Right memPressureText -> do
-      case parse parseMemoryPressureFreeMem "" memPressureText of
-        Left err -> pure (Left (errorBundlePretty err))
-        Right memvals -> pure (Right memvals)
+  alloca $ \freePtr ->
+    alloca $ \totalPtr -> do
+      ret <- c_pm36DarwinMemoryStats freePtr totalPtr
+      if ret /= 0
+        then pure (Left "sysctl: failed to read hw.memsize, vm.page_free_count or vm.pagesize")
+        else do
+          freeBytes <- peek freePtr
+          totalBytes <- peek totalPtr
+          pure (Right (freeBytes, totalBytes))
 #elif defined(linux_HOST_OS)
   eMemInfo <- readProcMemInfo
   pure $ case eMemInfo of
@@ -109,13 +123,10 @@ getMemoryPressure = do
     memStatus' <- peek ptr
     return $ Just (fromIntegral (ullAvailPhys memStatus') / fromIntegral (ullTotalPhys memStatus'))
 #elif defined(darwin_HOST_OS)
-  eres <- Exc.try (readProcess "memory_pressure" [] "") :: IO (Either IOError String)
-  case eres of
-    Left _err -> pure Nothing
-    Right memPressureText -> do
-      case parseMaybe parseMemoryPressureValue memPressureText of
-        Nothing -> pure Nothing
-        Just percentage -> pure (Just (percentage / 100.0))
+  percentage <- c_pm36DarwinMemoryFreePercentage
+  pure $ if percentage < 0
+           then Nothing
+           else Just (fromIntegral percentage / 100.0)
 #elif defined(linux_HOST_OS)
   eMemInfo <- readProcMemInfo
   pure $ case eMemInfo of
