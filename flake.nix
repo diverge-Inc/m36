@@ -44,12 +44,15 @@
             # Haskell スクリプト機能のテストは、実行時に GHC API で project-m36 と依存を
             # 読み込む。ビルド中はどちらもパッケージ DB に入っていないので、
             # ScriptSession が読む GHC_ENVIRONMENT で場所を教える。cabal が作る環境ファイルと
-            # 同じく、テストのモジュール（test/TutorialD/Interpreter/TestModule.hs）が
-            # import する scientific も公開する。
+            # 同じく、公開するパッケージを unit id で明示する：
+            # - project-m36 本体。名前（-package project-m36）だけだと、同じパッケージ名の
+            #   内部ライブラリ project-m36-tutoriald と取り違えて本体が隠れることがある
+            # - テストのモジュール（test/TutorialD/Interpreter/TestModule.hs）が import する scientific
             drvAttrs.preCheck = ''
               cat > "$PWD/pm36-test.ghc.env" <<EOF
               package-db $packageConfDir
               package-db $PWD/dist/package.conf.inplace
+              package-id $(ghc-pkg --package-db="$PWD/dist/package.conf.inplace" field project-m36 id --simple-output)
               package-id $(ghc-pkg --package-db="$packageConfDir" field scientific id --simple-output)
               EOF
               export GHC_ENVIRONMENT="$PWD/pm36-test.ghc.env"

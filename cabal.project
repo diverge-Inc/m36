@@ -4,42 +4,20 @@ packages:
 package *
   split-sections: True
 
-if impl(ghc >= 9.2)
+-- Upper bounds of third-party packages that have not caught up with newer
+-- GHC/boot library versions. Keep this in sync with nix/dependencies.nix, which
+-- loosens exactly the same bounds for the Nix build (instead of jailbreaking).
+-- Remove an entry once the package publishes a release or revision with higher bounds.
+
+-- linux-xattr-0.1.1.0 pins bytestring == 0.10.*
+if os(linux)
   allow-newer: linux-xattr:bytestring
 
--- Required patch from head.hackage to fix:
---   * `winery` compilation with GHC-9.6
-if impl(ghc >= 9.6)
-  repository head.hackage.ghc.haskell.org
-   url: https://ghc.gitlab.haskell.org/head.hackage/
-   secure: True
-   key-threshold: 3
-   root-keys:
-       26021a13b401500c8eb2761ca95c61f2d625bfef951b939a8124ed12ecf07329
-       7541f32a4ccca4f97aea3b22f5e593ba2c0267546016b992dfadcd2fe944e55d
-       f76d08be13e9a61a377a85e2fb63f4c5435d40f8feb3e12eb05905edb8cdea89
-
--- Loosened dependency bounds for compatibility with various versions of GHC.
--- Remove these upper bound relaxations once the dependency has a new version
--- released with higher upper bounds.
---
--- Note: The 'allow-newer' fields are /concatenative/, meaning that each
--- conditional statement which is satisfied will have thier listed packages
--- unioned together into an aggregated set of 'allow-newer' packages constraints.
--- Hence the 'allow-newer' constraints /accumulate/ as GHC versions increase.  
-if impl(ghc >= 9.6)
-   allow-newer:
-     barbies-th:base,
-     barbies-th:template-haskell
-     
-if impl(ghc >= 9.8)
-  allow-newer:
-    streamly-bytestring:bytestring,
-
+-- barbies-th-0.1.11: base < 4.20, template-haskell < 2.22.
+-- Note: since template-haskell 2.21 (GHC 9.8) barbies-th also needs a one-line
+-- source fix (nix/patches/barbies-th-template-haskell-2.21.patch), which the Nix
+-- build applies; a plain Hackage build with GHC >= 9.8 does not have it.
 if impl(ghc >= 9.10)
   allow-newer:
-    streamly:base,
-    streamly:template-haskell,
-    streamly-core:base,
-    streamly-core:template-haskell,
-    websockets:containers,
+    barbies-th:base,
+    barbies-th:template-haskell

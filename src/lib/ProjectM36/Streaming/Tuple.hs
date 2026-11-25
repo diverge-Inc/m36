@@ -12,6 +12,7 @@ import qualified Streamly.Data.Fold as FL
 import qualified Streamly.Data.Stream as S
 import qualified Streamly.Data.Stream.Prelude as SP
 import qualified Streamly.Internal.Data.Stream as SD
+import ProjectM36.Streaming.Compat (nested)
 import ProjectM36.Tuple
 import qualified Data.Set as Set
 import qualified Data.Vector as V
@@ -139,7 +140,7 @@ group' groupAttrs newAttrName attrs tupsIn = SD.unCross $ do
   groupedMap <- lift $ S.foldr groupFolder HM.empty tupsIn
   case HM.foldrWithKey tupleGenerator (Right []) groupedMap of
     Left err -> throwM err
-    Right tuples -> SD.Nested (SP.fromList tuples)
+    Right tuples -> nested (SP.fromList tuples)
         
 attributesForRelval :: AttributeName -> Attributes -> Either RelationalError Attributes
 attributesForRelval relvalAttrName attrs = do

@@ -16,6 +16,7 @@ import Streamly.Data.Stream (Stream)
 import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.Data.Stream.Prelude as Stream
 import qualified Streamly.Internal.Data.Stream as SD
+import ProjectM36.Streaming.Compat (nested)
 import qualified Streamly.Data.StreamK as StreamK
 import Prettyprinter
 import Prettyprinter.Render.Text
@@ -389,7 +390,7 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
                     tupS' = SD.unCross $ do
                       tA <- liftIO hsA
                       tcmp <- liftIO hscmp
-                      SD.Nested $ Stream.fromList $ 
+                      nested $ Stream.fromList $ 
                         [RelationTuple mempty mempty | HS.size tA == HS.size tcmp]
                 pure (Right (StreamRelation mempty tupS'))
     RelationValuedAttributeStreamPlan relAttr () _ -> checkCacheOr $ do
@@ -407,7 +408,7 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
         Right (StreamRelation _ tupS) -> do
           let tupS' = SD.unCross $ do
                 el <- liftIO $ SD.head tupS
-                SD.Nested $ Stream.fromList $ case el of
+                nested $ Stream.fromList $ case el of
                                                  Nothing -> [RelationTuple mempty mempty]
                                                  Just _ -> []
           pure (Right (StreamRelation mempty tupS'))
@@ -454,7 +455,7 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
                                           Right Nothing -> []
                                           Right (Just joinedTuple) -> [joinedTuple]
                                     ) bTupleList
-                        SD.Nested $ Stream.concatMap (Stream.fromList . tupleJoiner) tupSa
+                        nested $ Stream.concatMap (Stream.fromList . tupleJoiner) tupSa
                   pure (Right (StreamRelation attrsOut tupS'))
                   
     DifferenceTupleStreamsPlan exprA exprB () _ -> checkCacheOr $ do
@@ -468,7 +469,7 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
             Right (StreamRelation _ tupSb) -> do
               let tupS' = SD.unCross $ do
                     bTupleList <- liftIO $ Stream.toList tupSb        
-                    SD.Nested $ Stream.filter (`notElem` bTupleList) tupSa
+                    nested $ Stream.filter (`notElem` bTupleList) tupSa
               pure (Right (StreamRelation attrsA tupS'))
     GroupTupleStreamPlan groupAttrs newAttrName expr () orig -> checkCacheOr $ do
       --naive implementation scans for image relation for each grouped value
@@ -504,7 +505,7 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
                                       groupedRel = Relation groupProjectionAttributes newtups
                                   in
                                     tupleExtend tup (RelationTuple (A.singleton newAttr) (V.singleton (RelationAtom groupedRel)))
-                            SD.Nested $ fmap singleTupleGroupMatcher nonGroupProjectionTupS
+                            nested $ fmap singleTupleGroupMatcher nonGroupProjectionTupS
                       pure (Right (StreamRelation outAttrs tupS'))
     UngroupTupleStreamPlan groupAttrName expr () _ -> checkCacheOr $ do
       eS <- executePlan expr ctxTuples gfEnv cacheKeyBlackList cache
@@ -532,7 +533,7 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
         Right (StreamRelation attrs tupS) -> do
           let tupS' = SD.unCross $ do
                 uniqTups <- liftIO $ tuplesHashSet tupS
-                SD.Nested $ StreamK.toStream (StreamK.fromFoldable uniqTups)
+                nested $ StreamK.toStream (StreamK.fromFoldable uniqTups)
           pure (Right (StreamRelation attrs tupS'))
 {-    AlternativePlan first remainder () -> do
       -- catch cache miss exception- the cache entry may have been deleted

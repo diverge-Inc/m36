@@ -19,6 +19,7 @@ import Control.Monad (when, foldM)
 import Control.Exception
 import qualified Streamly.Data.Stream.Prelude as SP
 import qualified Streamly.Internal.Data.Stream as SD
+import ProjectM36.Streaming.Compat (nested)
 import Control.Monad.IO.Class (liftIO, MonadIO)
 import Data.Bifunctor
 import Data.Proxy
@@ -159,7 +160,7 @@ readTupleStream h = SD.unCross $ do
           Right tuples' -> do
 --            print ("readTupleBlock", tuples')
             pure $ SP.fromList tuples'
-  SD.Nested $ SP.concatMapM readTupleBlock (SP.fromList (V.toList (blockSizes tupleCacheInfo)))
+  nested $ SP.concatMapM readTupleBlock (SP.fromList (V.toList (blockSizes tupleCacheInfo)))
   
 deserialiseOnly' :: forall s. Serialise s => BS.ByteString -> Either WineryException s
 deserialiseOnly' bytes = do
