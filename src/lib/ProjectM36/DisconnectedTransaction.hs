@@ -3,6 +3,8 @@ module ProjectM36.DisconnectedTransaction where
 import ProjectM36.Base
 import qualified ProjectM36.IsomorphicSchema.Types as Schema
 import ProjectM36.IsomorphicSchema.Types (Schemas)
+import ProjectM36.Transaction.Types (Transaction)
+import qualified ProjectM36.Transaction.Types as Trans
 import ProjectM36.DatabaseContext as DBC
 import ProjectM36.DatabaseContext.Types as DBC
 import GHC.Generics
@@ -35,32 +37,19 @@ parentId = disconTransactionId
 isUpdated :: DisconnectedTransaction -> Bool
 isUpdated disconTrans = DBC.isUpdated (concreteDatabaseContext disconTrans)
 
--- | Create a fresh (unchanged marker-ed) disconnected transaction- used after a commit so all database context values should refer to previous transactions.
-freshTransaction :: CurrentHead -> TransactionId -> TransactionRefSchemas -> DisconnectedTransaction
-freshTransaction head' tid schemas =
+-- | The workspace of a session on top of a committed transaction, before the session has changed anything. Every field refers to the transaction which holds its value, so the workspace is not dirty and committing it would store nothing again.
+--
+-- Used wherever a session comes to rest on a transaction: when it is created, after a commit, a rollback, a merge, or a jump to another point of the graph.
+fromTransaction :: CurrentHead -> Transaction -> DisconnectedTransaction
+fromTransaction head' trans =
   DisconnectedTransaction {
   disconTransactionId = tid,
-  disconSchemas = freshSchemas tid schemas,
-  disconCurrentHead = head'
-  }
-
--- | Schemas for the workspace on top of the just-committed transaction: everything refers back to the committed transactions.
-freshSchemas :: TransactionId -> TransactionRefSchemas -> TransactionRefSchemas
-freshSchemas tid schemas =
-  schemas { Schema.concreteDatabaseContext = freshDatabaseContext tid (Schema.concreteDatabaseContext schemas),
-            Schema.subschemas = case Schema.subschemas schemas of
-                                  ValueMarker _ -> NotChangedSinceMarker tid
-                                  marker@NotChangedSinceMarker{} -> marker
-          }
-
-
-freshTransaction' :: CurrentHead -> TransactionId -> Schemas DatabaseContext -> DisconnectedTransaction
-freshTransaction' head' tid schemas =
-  DisconnectedTransaction {
-  disconTransactionId = tid,
-  disconSchemas = schemas',
+  disconSchemas = Schema.Schemas {
+      Schema.concreteDatabaseContext = unchangedDatabaseContext tid (Schema.concreteDatabaseContext transSchemas),
+      Schema.subschemas = unchangedSince tid (Schema.subschemas transSchemas)
+      },
   disconCurrentHead = head'
   }
   where
-    schemas' = freshSchemas tid schemas
-
+    tid = Trans.transactionId trans
+    transSchemas = Trans.schemas trans

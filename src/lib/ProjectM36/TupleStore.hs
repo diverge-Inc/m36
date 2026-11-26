@@ -1,15 +1,18 @@
 {-# LANGUAGE BangPatterns #-}
--- | Operations on the materialized tuple set representation ('TupleStore') used for the value of relation variables.
+-- | Operations on 'TupleStore', the materialized form in which a relation variable holds its tuples.
 --
 -- A store is a persistent (structure-sharing) hash set of atom vectors. Deriving a new version of a relation variable by inserting or deleting a few tuples costs time and memory proportional to the number of changed tuples, and two versions can be compared ('storeDiff') in time proportional to their difference. That is what lets a commit write, hash, and check only what it changed.
+--
+-- The functions which change a store take a store and the tuples to add or remove and return a store. There is no way to express "the old value and something more" other than as the new set of tuples, so the value of a relation variable cannot grow into a chain of pending operations.
 module ProjectM36.TupleStore where
 import ProjectM36.Base
+import ProjectM36.PointerEquality
 import qualified Data.HashSet as HS
 import qualified Data.HashMap.Strict as HM
 import qualified Data.HashMap.Internal as HMI
 import qualified Data.HashMap.Internal.Array as HA
 import qualified Data.Vector as V
-import qualified Data.Map as M
+import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Bits
 import Data.List (foldl')
@@ -18,12 +21,16 @@ import Data.Maybe (mapMaybe)
 type AtomVector = V.Vector Atom
 
 -- | An empty store with the attributes.
-emptyStore :: Attributes -> RelationTupleSet
-emptyStore attrs = TupleStore attrs 0 HS.empty M.empty
+emptyStore :: Attributes -> TupleStore
+emptyStore attrs = TupleStore attrs 0 HS.empty NoIndexes
 
-isStore :: RelationTupleSet -> Bool
-isStore TupleStore{} = True
-isStore TupleList{} = False
+-- | An empty store with the attributes and (empty) indexes of the argument.
+storeEmptyLike :: TupleStore -> TupleStore
+storeEmptyLike previous = foldr storeEnsureIndex (emptyStore (storeAttributes previous)) (indexedAttributeNames (storeIndexes previous))
+
+-- | The tuples of the store.
+storeTupleList :: TupleStore -> [RelationTuple]
+storeTupleList = asList . StoredTuples
 
 -- | The atoms of the tuple in the order of the attributes argument, or Nothing if the tuple lacks one of the attributes.
 atomsInOrder :: Attributes -> RelationTuple -> Maybe AtomVector
@@ -38,15 +45,26 @@ atomsInOrder attrs (RelationTuple tupAttrs atoms)
       atoms V.!? i
 
 -- | Build a store from tuples. Nothing if a tuple does not have exactly the attributes.
-storeFromTuples :: Attributes -> [RelationTuple] -> Maybe RelationTupleSet
+storeFromTuples :: Attributes -> [RelationTuple] -> Maybe TupleStore
 storeFromTuples attrs tups = storeFromVectors attrs <$> mapM (atomsInOrder attrs) tups
 
 -- | Build a store from atom vectors which are already in the order of the attributes.
-storeFromVectors :: Attributes -> [AtomVector] -> RelationTupleSet
+storeFromVectors :: Attributes -> [AtomVector] -> TupleStore
 storeFromVectors attrs = storeInsertVectors (emptyStore attrs)
 
+-- | The body of the relation as a store. Constant time if it is one already. Nothing if the tuples do not match the attributes.
+storeFromRelation :: Relation -> Maybe TupleStore
+storeFromRelation (Relation _ (StoredTuples store)) = Just store
+storeFromRelation (Relation attrs (TupleList tups)) = storeFromTuples attrs tups
+
+-- | Like 'storeFromRelation' but with the indexes of an earlier value of the same relation variable.
+storeFromRelationLike :: TupleStore -> Relation -> Maybe TupleStore
+storeFromRelationLike previous rel = do
+  store <- storeFromRelation rel
+  pure (foldl' (flip storeEnsureIndex) store (indexedAttributeNames (storeIndexes previous)))
+
 -- | Insert atom vectors (in the attribute order of the store). Tuples already present are skipped.
-storeInsertVectors :: RelationTupleSet -> [AtomVector] -> RelationTupleSet
+storeInsertVectors :: TupleStore -> [AtomVector] -> TupleStore
 storeInsertVectors (TupleStore attrs size0 tups0 idxs0) vecs =
   let (size', tups', idxs') = foldl' ins (size0, HS.toMap tups0, idxs0) vecs
   in TupleStore attrs size' (HS.fromMap tups') idxs'
@@ -55,11 +73,10 @@ storeInsertVectors (TupleStore attrs size0 tups0 idxs0) vecs =
       let h = HMI.hash vec in
       case HMI.lookup' h vec tups of
         Just () -> acc
-        Nothing -> (size + 1, HMI.insert' h vec () tups, M.map (indexInsert vec) idxs)
-storeInsertVectors (TupleList tups) _ = TupleList tups -- not a store; callers check with 'isStore'
+        Nothing -> (size + 1, HMI.insert' h vec () tups, mapIndexes (indexInsert vec) idxs)
 
 -- | Delete atom vectors (in the attribute order of the store). Missing tuples are skipped.
-storeDeleteVectors :: RelationTupleSet -> [AtomVector] -> RelationTupleSet
+storeDeleteVectors :: TupleStore -> [AtomVector] -> TupleStore
 storeDeleteVectors (TupleStore attrs size0 tups0 idxs0) vecs =
   let (size', tups', idxs') = foldl' del (size0, HS.toMap tups0, idxs0) vecs
   in TupleStore attrs size' (HS.fromMap tups') idxs'
@@ -68,36 +85,15 @@ storeDeleteVectors (TupleStore attrs size0 tups0 idxs0) vecs =
       let h = HMI.hash vec in
       case HMI.lookup' h vec tups of
         Nothing -> acc
-        Just () -> (size - 1, HMI.delete' h vec tups, M.map (indexDelete vec) idxs)
-storeDeleteVectors (TupleList tups) _ = TupleList tups
+        Just () -> (size - 1, HMI.delete' h vec tups, mapIndexes (indexDelete vec) idxs)
 
--- | Insert the tuples of any tuple set into a store. Nothing if the first argument is not a store or a tuple does not have the attributes of the store.
-storeInsertTupleSet :: RelationTupleSet -> RelationTupleSet -> Maybe RelationTupleSet
-storeInsertTupleSet store@(TupleStore attrs _ _ _) other =
+-- | Insert the tuples of any tuple set into a store. Nothing if a tuple does not have the attributes of the store.
+storeInsertTupleSet :: TupleStore -> RelationTupleSet -> Maybe TupleStore
+storeInsertTupleSet store other =
   case other of
-    TupleStore otherAttrs _ otherTups _ | attributesVec otherAttrs == attributesVec attrs ->
-                                            Just (storeInsertVectors store (HS.toList otherTups))
-    _ -> storeInsertVectors store <$> mapM (atomsInOrder attrs) (asList other)
-storeInsertTupleSet TupleList{} _ = Nothing
-
-storeSize :: RelationTupleSet -> Maybe Int
-storeSize (TupleStore _ size _ _) = Just size
-storeSize TupleList{} = Nothing
-
--- | Convert the body of the relation to a store unless it is one already. Nothing if the tuples do not match the attributes.
-materializeRelation :: Relation -> Maybe Relation
-materializeRelation rel@(Relation _ TupleStore{}) = Just rel
-materializeRelation (Relation attrs (TupleList tups)) = Relation attrs <$> storeFromTuples attrs tups
-
--- | Like 'materializeRelation' but carry over the indexes of an earlier value of the same relation variable.
-materializeRelationLike :: RelationTupleSet -> Relation -> Maybe Relation
-materializeRelationLike previous rel = do
-  Relation attrs store <- materializeRelation rel
-  pure (Relation attrs (foldl' (flip storeEnsureIndex) store (M.keys (storeIndexes previous))))
-
-storeIndexes :: RelationTupleSet -> TupleStoreIndexes
-storeIndexes (TupleStore _ _ _ idxs) = idxs
-storeIndexes TupleList{} = M.empty
+    StoredTuples otherStore | attributesVec (storeAttributes otherStore) == attributesVec (storeAttributes store) ->
+                                Just (storeInsertVectors store (HS.toList (storeTuples otherStore)))
+    _ -> storeInsertVectors store <$> mapM (atomsInOrder (storeAttributes store)) (asList other)
 
 -- * comparing versions
 
@@ -107,8 +103,7 @@ storeDiff :: HS.HashSet AtomVector -> HS.HashSet AtomVector -> ([AtomVector], [A
 storeDiff a b = go (HS.toMap a) (HS.toMap b) ([], [])
   where
     go :: HM.HashMap AtomVector () -> HM.HashMap AtomVector () -> ([AtomVector], [AtomVector]) -> ([AtomVector], [AtomVector])
-    -- both nodes must be evaluated before their pointers are compared; an unevaluated argument would never be pointer-equal to anything
-    go !x !y acc | ptrEquals x y = acc
+    go x y acc | ptrEquals (Forced x) (Forced y) = acc
     go HMI.Empty y (l, r) = (l, HM.keys y ++ r)
     go x HMI.Empty (l, r) = (HM.keys x ++ l, r)
     go (HMI.BitmapIndexed bx ax) (HMI.BitmapIndexed by ay) acc = children bx ax by ay acc
@@ -167,34 +162,58 @@ indexDelete vec (TupleStoreIndex positions m dups) =
         remaining@[_] -> TupleStoreIndex positions (HM.insert key remaining m) (if length bucket > 1 then dups - 1 else dups)
         remaining -> TupleStoreIndex positions (HM.insert key remaining m) dups
 
--- | Add an index over the attribute names unless the store already has it. No-op if the argument is not a store or lacks one of the attributes.
-storeEnsureIndex :: S.Set AttributeName -> RelationTupleSet -> RelationTupleSet
+-- | The index on exactly these attributes.
+lookupIndex :: S.Set AttributeName -> TupleStoreIndexes -> Maybe TupleStoreIndex
+lookupIndex _ NoIndexes = Nothing
+lookupIndex names (IndexOn idxNames idx rest)
+  | idxNames == names = Just idx
+  | otherwise = lookupIndex names rest
+
+-- | The attribute names of each index.
+indexedAttributeNames :: TupleStoreIndexes -> [S.Set AttributeName]
+indexedAttributeNames NoIndexes = []
+indexedAttributeNames (IndexOn names _ rest) = names : indexedAttributeNames rest
+
+mapIndexes :: (TupleStoreIndex -> TupleStoreIndex) -> TupleStoreIndexes -> TupleStoreIndexes
+mapIndexes _ NoIndexes = NoIndexes
+mapIndexes f (IndexOn names idx rest) = IndexOn names (f idx) (mapIndexes f rest)
+
+-- | Add an index, keeping the list in ascending order of the attribute names.
+addIndex :: S.Set AttributeName -> TupleStoreIndex -> TupleStoreIndexes -> TupleStoreIndexes
+addIndex names idx NoIndexes = IndexOn names idx NoIndexes
+addIndex names idx idxs@(IndexOn otherNames otherIdx rest)
+  | names < otherNames = IndexOn names idx idxs
+  | otherwise = IndexOn otherNames otherIdx (addIndex names idx rest)
+
+-- | Whether the store has an index on exactly these attributes.
+storeHasIndex :: S.Set AttributeName -> TupleStore -> Bool
+storeHasIndex names store = maybe False (const True) (lookupIndex names (storeIndexes store))
+
+-- | Add an index over the attribute names unless the store already has it (in which case the store is returned as it is, not rebuilt). No-op if the store lacks one of the attributes.
+storeEnsureIndex :: S.Set AttributeName -> TupleStore -> TupleStore
 storeEnsureIndex names store@(TupleStore attrs size tups idxs)
-  | M.member names idxs = store
+  | storeHasIndex names store = store
   | otherwise =
       case indexPositions attrs names of
         Nothing -> store
         Just positions ->
           let idx = HS.foldl' (flip indexInsert) (TupleStoreIndex positions HM.empty 0) tups
-          in TupleStore attrs size tups (M.insert names idx idxs)
-storeEnsureIndex _ tupSet = tupSet
+          in TupleStore attrs size tups (addIndex names idx idxs)
 
 -- | The tuples whose indexed attributes equal the atoms (given in ascending order of attribute name), if the store has an index on exactly those attributes.
-storeIndexLookup :: S.Set AttributeName -> AtomVector -> RelationTupleSet -> Maybe [RelationTuple]
-storeIndexLookup names key (TupleStore attrs _ _ idxs) = do
-  idx <- M.lookup names idxs
-  pure (map (RelationTuple attrs) (HM.lookupDefault [] key (tsiMap idx)))
-storeIndexLookup _ _ TupleList{} = Nothing
+storeIndexLookup :: S.Set AttributeName -> AtomVector -> TupleStore -> Maybe [RelationTuple]
+storeIndexLookup names key store = do
+  idx <- lookupIndex names (storeIndexes store)
+  pure (map (RelationTuple (storeAttributes store)) (HM.lookupDefault [] key (tsiMap idx)))
 
 -- | Find the tuples matching attribute/atom equalities using an index over a subset of the given attributes. The result may contain tuples which do not match the equalities which are not covered by the index, so the caller still applies its full predicate.
-storeLookupByEqualities :: M.Map AttributeName Atom -> RelationTupleSet -> Maybe [RelationTuple]
-storeLookupByEqualities equalities store@(TupleStore _ _ _ idxs) =
-  case mapMaybe usable (M.keys idxs) of
+storeLookupByEqualities :: M.Map AttributeName Atom -> TupleStore -> Maybe [RelationTuple]
+storeLookupByEqualities equalities store =
+  case mapMaybe usable (indexedAttributeNames (storeIndexes store)) of
     [] -> Nothing
     names : _ -> storeIndexLookup names (V.fromList (map (equalities M.!) (S.toAscList names))) store
   where
     usable names = if not (S.null names) && all (`M.member` equalities) names then Just names else Nothing
-storeLookupByEqualities _ TupleList{} = Nothing
 
 -- | The attribute = constant terms which every tuple satisfying the predicate must satisfy.
 predicateEqualities :: RestrictionPredicateExprBase a -> M.Map AttributeName Atom
@@ -203,6 +222,5 @@ predicateEqualities (AttributeEqualityPredicate attrName (NakedAtomExpr atom)) =
 predicateEqualities _ = M.empty
 
 -- | Whether the attribute names are a key of the tuples: Just True/False if the store has an index on them, Nothing if it cannot tell cheaply.
-storeIsUnique :: S.Set AttributeName -> RelationTupleSet -> Maybe Bool
-storeIsUnique names (TupleStore _ _ _ idxs) = (\idx -> tsiDuplicates idx == 0) <$> M.lookup names idxs
-storeIsUnique _ TupleList{} = Nothing
+storeIsUnique :: S.Set AttributeName -> TupleStore -> Maybe Bool
+storeIsUnique names store = (\idx -> tsiDuplicates idx == 0) <$> lookupIndex names (storeIndexes store)

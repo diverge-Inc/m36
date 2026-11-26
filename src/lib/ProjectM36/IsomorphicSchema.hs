@@ -269,7 +269,7 @@ inclusionDependencyInSchema schema (InclusionDependency rexprA rexprB) = do
 inclusionDependenciesInSchema :: Schema -> InclusionDependencies -> Either RelationalError InclusionDependencies
 inclusionDependenciesInSchema schema incDeps = M.fromList <$> mapM (\(depName, dep) -> inclusionDependencyInSchema schema dep >>= \newDep -> pure (depName, newDep)) (M.toList incDeps)
 
-relationVariablesInSchema :: Schema -> Either RelationalError RelationVariables
+relationVariablesInSchema :: Schema -> Either RelationalError (M.Map RelVarName GraphRefRelationalExpr)
 relationVariablesInSchema schema@(Schema morphs) = foldM transform M.empty morphs
   where
     transform newRvMap morph = do

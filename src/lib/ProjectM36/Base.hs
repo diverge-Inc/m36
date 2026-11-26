@@ -1,4 +1,4 @@
-{-# LANGUAGE ExistentialQuantification,DeriveGeneric,DeriveAnyClass,FlexibleInstances,OverloadedStrings, DeriveTraversable, DerivingVia, TemplateHaskell, TypeFamilies, BangPatterns, DuplicateRecordFields, PatternSynonyms, ViewPatterns, MagicHash #-}
+{-# LANGUAGE ExistentialQuantification,DeriveGeneric,DeriveAnyClass,FlexibleInstances,OverloadedStrings, DeriveTraversable, DerivingVia, TemplateHaskell, TypeFamilies, BangPatterns, DuplicateRecordFields, PatternSynonyms, ViewPatterns #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module ProjectM36.Base where
@@ -8,7 +8,7 @@ import Data.Functor.Foldable.TH
 import qualified Data.Map as M
 import qualified Data.HashSet as HS
 import qualified Data.HashMap.Strict as HM
-import GHC.Exts (reallyUnsafePtrEquality#, isTrue#)
+import ProjectM36.PointerEquality
 import Data.Hashable (Hashable, hashWithSalt)
 import qualified Data.Set as S
 import Data.UUID (UUID)
@@ -151,12 +151,11 @@ sortedAttributesIndices attrs = L.sortBy (\(_, Attribute name1 _) (_,Attribute n
 -- There are two representations:
 --
 -- * 'TupleList' is a plain list of tuples. It is what relational operators produce and consume.
--- * 'TupleStore' is the materialized form used for the value of a relation variable. The tuples are kept as atom vectors (all in the attribute order of the store) in a persistent hash set, so that a new version of the relation variable shares structure with the previous one and inserting a few tuples does not cost time or space proportional to the size of the relation.
+-- * 'StoredTuples' is a 'TupleStore', the materialized form in which a relation variable holds its tuples. Reading such a relation variable yields a relation with this body without copying anything.
 --
 -- The 'RelationTupleSet' pattern (with its 'asList' field) presents both as a list so that code which does not care about the representation is unaffected.
 data RelationTupleSet = TupleList [RelationTuple]
-                      | TupleStore !Attributes !Int !(HS.HashSet (V.Vector Atom)) !TupleStoreIndexes
-                        -- ^ attributes (fixing the atom order), number of tuples, the tuples, unique-key indexes
+                      | StoredTuples !TupleStore
 
 pattern RelationTupleSet :: [RelationTuple] -> RelationTupleSet
 pattern RelationTupleSet { asList } <- (tupleSetAsList -> asList)
@@ -165,10 +164,23 @@ pattern RelationTupleSet { asList } <- (tupleSetAsList -> asList)
 
 tupleSetAsList :: RelationTupleSet -> [RelationTuple]
 tupleSetAsList (TupleList tups) = tups
-tupleSetAsList (TupleStore attrs _ tups _) = map (RelationTuple attrs) (HS.toList tups)
+tupleSetAsList (StoredTuples store) = map (RelationTuple (storeAttributes store)) (HS.toList (storeTuples store))
 
--- | Indexes of a 'TupleStore', keyed by the names of the indexed attributes.
-type TupleStoreIndexes = M.Map (S.Set AttributeName) TupleStoreIndex
+-- | A materialized set of tuples. The tuples are kept as atom vectors (all in the order of the attributes of the store) in a persistent hash set, so that a new version shares structure with the version it was derived from: inserting or deleting a few tuples costs time and space proportional to those tuples, not to the size of the store. The operations are in "ProjectM36.TupleStore".
+--
+-- All fields are strict, so a store taken out of a data structure is always evaluated, as are the tuples and indexes inside it.
+data TupleStore = TupleStore {
+  storeAttributes :: !Attributes, -- ^ the attributes, which fix the order of the atoms in the vectors
+  storeSize :: !Int, -- ^ number of tuples
+  storeTuples :: !(HS.HashSet (V.Vector Atom)),
+  storeIndexes :: !TupleStoreIndexes -- ^ unique-key indexes
+  }
+
+-- | The indexes of a 'TupleStore' with the names of the attributes each one covers, in ascending order of those names. A store has one index per declared key, so this is a short list.
+--
+-- The list is strict in its spine and in its elements. An index is therefore brought up to date when a tuple is inserted or deleted, not when the index is next used: with a lazy container the updates pile up unevaluated (one per changed tuple and index) and are all paid for by whichever statement happens to use the index first.
+data TupleStoreIndexes = NoIndexes
+                       | IndexOn !(S.Set AttributeName) !TupleStoreIndex !TupleStoreIndexes
 
 -- | An index over a subset of the attributes of a 'TupleStore'. It serves both to find tuples by the indexed attributes and to tell cheaply whether the indexed attributes are a key (no two tuples agree on them).
 data TupleStoreIndex = TupleStoreIndex {
@@ -177,10 +189,22 @@ data TupleStoreIndex = TupleStoreIndex {
   tsiDuplicates :: !Int -- ^ number of entries with more than one tuple; zero if and only if the indexed attributes are unique
   }
 
--- | Pointer equality; 'True' implies that both arguments are the same value, 'False' implies nothing.
-ptrEquals :: a -> a -> Bool
-ptrEquals a b = isTrue# (reallyUnsafePtrEquality# a b)
-{-# INLINE ptrEquals #-}
+-- | The relation which the store holds. Constant time: the relation's body is the store itself.
+storeRelation :: TupleStore -> Relation
+storeRelation store = Relation (storeAttributes store) (StoredTuples store)
+
+-- | Stores are equal if they hold the same tuples; indexes do not matter.
+instance Eq TupleStore where
+  store1 == store2
+    | attributesVec (storeAttributes store1) == attributesVec (storeAttributes store2) =
+        storeSize store1 == storeSize store2 && (ptrEquals (Forced (storeTuples store1)) (Forced (storeTuples store2)) || storeTuples store1 == storeTuples store2)
+    | otherwise = hset store1 == hset store2
+    where
+      hset = HS.fromList . tupleSetAsList . StoredTuples
+
+-- the atom vectors of a store are evaluated when they are hashed on insertion, so there is nothing left to force (and walking a large store on every deep evaluation would defeat its purpose)
+instance NFData TupleStore where
+  rnf store = rnf (storeAttributes store) `seq` rnf (storeSize store)
 
 -- same output format as the instance derived for the former newtype
 instance Show RelationTupleSet where
@@ -204,16 +228,14 @@ instance Read Relation where
   readsPrec = error "relation read not supported"
 
 instance Eq RelationTupleSet where
- TupleStore attrs1 size1 tups1 _ == TupleStore attrs2 size2 tups2 _
-   | attributesVec attrs1 == attributesVec attrs2 = size1 == size2 && (ptrEquals tups1 tups2 || tups1 == tups2)
+ StoredTuples store1 == StoredTuples store2 = store1 == store2
  set1 == set2 = hset set1 == hset set2
    where
      hset = HS.fromList . asList
 
 instance NFData RelationTupleSet where
   rnf (TupleList tups) = rnf tups
-  -- the atom vectors of a store are evaluated when they are hashed on insertion, so there is nothing left to force (and walking a large store on every deep evaluation would defeat its purpose)
-  rnf (TupleStore attrs size _ _) = rnf attrs `seq` rnf size
+  rnf (StoredTuples store) = rnf store
 
 --the same hash must be generated for equal tuples so that the hashset equality works
 instance Hashable RelationTuple where
@@ -251,12 +273,11 @@ instance Eq Relation where
 
 -- the tuples of a relation normally all point to the attributes of the relation; those are forced once instead of once per tuple
 instance NFData Relation where
-  rnf (Relation !attrs (TupleList tups)) = rnf attrs `seq` go tups
+  rnf (Relation attrs (TupleList tups)) = rnf attrs `seq` go tups
     where
-      -- (the bangs make sure that the pointers which are compared are those of the evaluated attributes)
       go [] = ()
-      go (RelationTuple !tupAttrs atoms : rest) = (if ptrEquals tupAttrs attrs then () else rnf tupAttrs) `seq` rnf atoms `seq` go rest
-  rnf (Relation attrs store@TupleStore{}) = rnf attrs `seq` rnf store
+      go (RelationTuple tupAttrs atoms : rest) = (if ptrEquals (Forced tupAttrs) (Forced attrs) then () else rnf tupAttrs) `seq` rnf atoms `seq` go rest
+  rnf (Relation attrs (StoredTuples store)) = rnf attrs `seq` rnf store
                                
 instance Hashable Relation where                               
   hashWithSalt salt (Relation attrs tupSet) = salt `hashWithSalt` 
@@ -385,7 +406,37 @@ data DataConstructorDefArg = DataConstructorDefTypeConstructorArg TypeConstructo
                            deriving (Show, Generic, Eq, NFData, Hashable, Read)
                                     
 type InclusionDependencies = M.Map IncDepName InclusionDependency
-type RelationVariables = M.Map RelVarName GraphRefRelationalExpr
+-- | The relation variables of a database context. Insert into it with the functions of "Data.Map.Strict" so that the values are evaluated.
+type RelationVariables = M.Map RelVarName RelVarValue
+
+-- | The value of a relation variable.
+data RelVarValue =
+  -- | The relation variable holds its tuples. A statement which inserts, updates, or deletes tuples derives the next store from this one, so its cost depends on the tuples it touches and the relation variable remains a store.
+  StoredRelVar !TupleStore |
+  -- | The relation variable is defined by an expression which is evaluated whenever the relation variable is read: the result of assigning an expression which is not a constant, or of merging two branches.
+  DerivedRelVar !GraphRefRelationalExpr
+
+-- | What reading the relation variable evaluates.
+relVarExpr :: RelVarValue -> GraphRefRelationalExpr
+relVarExpr (StoredRelVar store) = ExistingRelation (storeRelation store)
+relVarExpr (DerivedRelVar expr) = expr
+
+-- | A relation variable defined by the expression. An expression which is nothing but a stored relation becomes a stored relation variable.
+relVarFromExpr :: GraphRefRelationalExpr -> RelVarValue
+relVarFromExpr (ExistingRelation (Relation _ (StoredTuples store))) = StoredRelVar store
+relVarFromExpr expr = DerivedRelVar expr
+
+instance Eq RelVarValue where
+  StoredRelVar store1 == StoredRelVar store2 = store1 == store2
+  rv1 == rv2 = relVarExpr rv1 == relVarExpr rv2
+
+-- shown as the expression it stands for
+instance Show RelVarValue where
+  showsPrec d = showsPrec d . relVarExpr
+
+instance NFData RelVarValue where
+  rnf (StoredRelVar store) = rnf store
+  rnf (DerivedRelVar expr) = rnf expr
 
 data GraphRefTransactionMarker = TransactionMarker TransactionId |
                                  UncommittedContextMarker

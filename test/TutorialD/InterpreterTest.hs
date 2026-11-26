@@ -234,7 +234,7 @@ assertTutdEqual contextIn transId graph expected tutd = assertEqual (unpack tutd
               Nothing -> Left $ RelVarNotDefinedError "x"
               Just relExpr -> do
                 let env = freshGraphRefRelationalExprEnv (Just context) graph
-                runGraphRefRelationalExprM env (evalGraphRefRelationalExpr relExpr)
+                runGraphRefRelationalExprM env (evalGraphRefRelationalExpr (relVarExpr relExpr))
 
 
 transactionGraphBasicTest :: Test
@@ -276,7 +276,7 @@ transactionRollbackTest = TestCase $ do
   eX <- executeRelationalExpr sessionId dbconn (RelationVariable "x" ())
   
   assertEqual "validate context" (Left (RelVarNotDefinedError "x")) eX
-  let graphEq graphArg = S.map transactionId (transactionsForGraph graphArg)
+  let graphEq graphArg = transactionIdsForGraph graphArg
   assertEqual "validate graph" (graphEq graph) (graphEq graph')
 
 --commit a new transaction with "x" relation, jump to first transaction, verify that "x" is not present

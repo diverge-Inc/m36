@@ -59,7 +59,7 @@ testFindColumn = TestCase $ do
 testSelect :: Test
 testSelect = TestCase $ do
   -- check that SQL and tutd compile to same thing
-  let sqlDBContext = dateExamples { relationVariables = Identity (M.singleton "snull" (ExistingRelation sNullRelVar)) <> relationVariables dateExamples }
+  let sqlDBContext = dateExamples { relationVariables = Identity (M.singleton "snull" (relVarFromExpr (ExistingRelation sNullRelVar))) <> relationVariables dateExamples }
   (tgraph,transId) <- freshTransactionGraph (toDatabaseContext sqlDBContext)
   (sess, conn) <- dateExamplesConnection emptyNotificationCallback
   
@@ -336,7 +336,7 @@ testSelect = TestCase $ do
 
 testCreateTable :: Test
 testCreateTable = TestCase $ do
-  let sqlDBContext = dateExamples { relationVariables = Identity (M.singleton "snull" (ExistingRelation sNullRelVar)) <> relationVariables dateExamples }
+  let sqlDBContext = dateExamples { relationVariables = Identity (M.singleton "snull" (relVarFromExpr (ExistingRelation sNullRelVar))) <> relationVariables dateExamples }
   (tgraph,transId) <- freshTransactionGraph (toDatabaseContext sqlDBContext)
 
   let createTableTests = [
@@ -400,7 +400,7 @@ testCreateTable = TestCase $ do
 testDBUpdate :: Test
 testDBUpdate = TestCase $ do
   let sqlDBContext = dateExamples { relationVariables =
-                                      Identity (M.singleton "snull" (ExistingRelation sNullRelVar)) <> relationVariables dateExamples,
+                                      Identity (M.singleton "snull" (relVarFromExpr (ExistingRelation sNullRelVar))) <> relationVariables dateExamples,
                                     typeConstructorMapping = typeConstructorMapping dateExamples <> Identity nullTypeConstructorMapping
                                   }
   (tgraph,transId) <- freshTransactionGraph (toDatabaseContext sqlDBContext)
@@ -467,7 +467,7 @@ testDBUpdate = TestCase $ do
 testTransactionGraphOps :: Test
 testTransactionGraphOps = TestCase $ do
   let sqlDBContext = dateExamples { relationVariables =
-                                      M.insert "snull" (ExistingRelation sNullRelVar) (relationVariables dateExamples),
+                                      M.insert "snull" (relVarFromExpr (ExistingRelation sNullRelVar)) (relationVariables dateExamples),
                                     typeConstructorMapping = typeConstructorMapping dateExamples <> nullTypeConstructorMapping
                                   }
   (tgraph,transId) <- freshTransactionGraph sqlDBContext

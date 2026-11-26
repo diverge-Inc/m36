@@ -188,7 +188,7 @@ planGraphRefRelationalExpr (RelationVariable name tid) gfEnv = do
   rvMap <- resolveDBC' graph ctx relationVariables
   case M.lookup name rvMap of
     Nothing -> Left (RelVarNotDefinedError name)
-    Just rvExpr -> planGraphRefRelationalExpr rvExpr gfEnv
+    Just rv -> planGraphRefRelationalExpr (relVarExpr rv) gfEnv
 planGraphRefRelationalExpr orig@(RelationValuedAttribute relAttrName) gfEnv = do
   case A.attributeForName relAttrName (envAttributes gfEnv) of
     Left err -> throw err
@@ -341,7 +341,7 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
       checkCacheOr $ do
         eStream <- case expr of
           -- equality on indexed attributes of a materialized relation: start from the tuples found through the index instead of from all tuples (the complete predicate is still applied below)
-          ExistingRelationPlan (Relation attrs store) ()
+          ExistingRelationPlan (Relation attrs (StoredTuples store)) ()
             | Just candidates <- TStore.storeLookupByEqualities (TStore.predicateEqualities predExpr) store ->
                 pure (Right (StreamRelation attrs (Stream.fromList candidates)))
           _ -> executePlan expr ctxTuples gfEnv cacheKeyBlackList cache

@@ -485,7 +485,7 @@ createSessionAtTransactionId_ mHeadName commitId newSessionId (InProcessConnecti
     case RE.transactionForId commitId graph of
         Left err -> pure (Left err)
         Right transaction -> do
-            let freshDiscon = Discon.freshTransaction' currentHead' commitId (Trans.schemas transaction)
+            let freshDiscon = Discon.fromTransaction currentHead' transaction
                 currentHead' = case mHeadName of
                                 Just hname -> Discon.CurrentHeadBranch hname
                                 Nothing -> Discon.CurrentHeadTransactionId commitId

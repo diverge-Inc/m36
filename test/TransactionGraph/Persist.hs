@@ -2,12 +2,13 @@
 import Test.HUnit
 import ProjectM36.Base
 import ProjectM36.Persist (DiskSync(NoDiskSync))
-import ProjectM36.RelationalExpression (resolveDBC')
+import ProjectM36.RelationalExpression (resolveDBC', transactionForId)
 import ProjectM36.TransactionGraph.Persist
 import ProjectM36.IsomorphicSchema.Types
 import ProjectM36.Transaction.Types as T
 import ProjectM36.TransactionGraph as TG
 import ProjectM36.TransactionGraph.Types
+import qualified ProjectM36.TransactionGraph.Index as TIdx
 import ProjectM36.DatabaseContext
 import ProjectM36.DisconnectedTransaction
 import ProjectM36.DateExamples
@@ -26,7 +27,8 @@ import Data.Time.Calendar
 import ProjectM36.Client as C
 import ProjectM36.Relation
 import ProjectM36.DatabaseContext.Types hiding (DatabaseContextFunctionUtils(..))
-import Control.Monad (forM)
+import qualified ProjectM36.DatabaseContext.Types as DBT
+import Control.Monad (forM, forM_)
 import qualified Data.Vector as V
 import qualified Data.ByteString as BS
 import ProjectM36.Attribute (attributesFromList)
@@ -45,6 +47,7 @@ testList = TestList [testBootstrapDB,
                      testMerkleHashValidation,
                      testTransactionDirectorySizeGrowth,
                      testIncrementalRelVarPersistence,
+                     testStoredRelVarsAndReferences,
                      testInterruptedLogWrite
                      ]
 
@@ -86,7 +89,7 @@ testDBSimplePersistence = TestCase $ withSystemTempDirectory "m36testdb" $ \temp
                   _ <- transactionGraphPersist NoDiskSync dbdir graph'
                   --reload the graph from the filesystem and confirm that the transaction is present
                   graphErr <- transactionGraphLoad dbdir emptyTransactionGraph Nothing
-                  let mapEq graphArg = S.map transactionId (transactionsForGraph graphArg)
+                  let mapEq graphArg = transactionIdsForGraph graphArg
                   case graphErr of
                     Left err -> assertFailure (show err)
                     Right graph'' -> assertBool "graph equality" (mapEq graph'' == mapEq graph')
@@ -129,12 +132,12 @@ testMerkleHashValidation = TestCase $
                                 Left err -> error ("resolveDBC' failure: " <> show err)
                                 Right rv -> rv
                     updatedContext = ctx {
-                      relationVariables = ValueMarker (M.insert "malicious" (ExistingRelation relationFalse) relVars) }
+                      relationVariables = ValueMarker (M.insert "malicious" (relVarFromExpr (ExistingRelation relationFalse)) relVars) }
                       in
                 Schemas updatedContext sschemas
           maliciousGraph = TransactionGraph malHeads malTransSet
           malHeads = M.insert "master" updatedTrans (transactionHeadsForGraph graph)
-          malTransSet = S.insert updatedTrans (transactionsForGraph graph)
+          malTransSet = TIdx.insert updatedTrans (transactionsForGraph graph)
           malMerkleHash = calculateMerkleHash updatedTrans maliciousGraph
           regMerkleHash = merkleHash (transactionInfo trans)
       --validate and fail
@@ -280,6 +283,87 @@ testIncrementalRelVarPersistence = TestCase $
     assertEqual "key violation after reopening" (Left (InclusionDependencyCheckError "event_id_key" Nothing)) dup'
     run sess' conn' (insertEvent (eventCount + 1))
     assertIOEither $ commit sess' conn'
+    close conn'
+
+-- what the types of the relation variables and of the unchanged markers promise, observed from outside:
+-- a relation variable which holds its tuples keeps holding them whatever statements change it, a statement which cannot be evaluated fails instead of being stored as a pending expression, and every transaction refers directly to the transaction which holds a value
+testStoredRelVarsAndReferences :: Test
+testStoredRelVarsAndReferences = TestCase $
+  withSystemTempDirectory "m36testdb" $ \tempdir -> do
+    rando <- initStdGen
+    let dbdir = tempdir </> "db"
+        connInfo = InProcessConnectionInfo (MinimalPersistence dbdir) emptyNotificationCallback [] basicDatabaseContext rando adminRoleName
+        run sess conn expr = assertIOEither (executeDatabaseContextExpr sess conn expr)
+        eventIsStored conn = do
+          graph <- transactionGraph_ conn
+          case transactionForHead "master" graph of
+            Nothing -> assertFailure "no master head" >> pure False
+            Just headTrans ->
+              case resolveDBC' graph (T.concreteDatabaseContext headTrans) relationVariables of
+                Right relVars | Just StoredRelVar{} <- M.lookup "event" relVars -> pure True
+                _ -> pure False
+    conn <- assertIOEither $ connectProjectM36 connInfo
+    sess <- assertIOEither $ createSessionAtHead conn "master"
+    run sess conn (Define "event" (map NakedAttributeExpr (V.toList (attributesVec eventAttrs))))
+    assertIOEither $ commit sess conn
+    forM_ [1 .. 5] $ \i -> do
+      run sess conn (insertEvent i)
+      assertIOEither $ commit sess conn
+    run sess conn (Update "event" (M.singleton "payload" (NakedAtomExpr (TextAtom "updated"))) (eventWithId 2))
+    run sess conn (Delete "event" (eventWithId 3))
+    -- an assignment of an expression defines the relation variable by that expression; the next insert makes it hold its tuples again
+    run sess conn (Assign "event" (Union (RelationVariable "event" ()) (RelationVariable "event" ())))
+    run sess conn (insertEvent 6)
+    assertIOEither $ commit sess conn
+    -- statements which cannot be evaluated are rejected and leave the relation variable as it was
+    badDelete <- executeDatabaseContextExpr sess conn (Delete "event" (AttributeEqualityPredicate "nosuchattribute" (NakedAtomExpr (IntegerAtom 1))))
+    assertBool ("delete with an invalid predicate: " <> show badDelete) (isLeft badDelete)
+    badUpdate <- executeDatabaseContextExpr sess conn (Update "event" (M.singleton "nosuchattribute" (NakedAtomExpr (IntegerAtom 1))) TruePredicate)
+    assertBool ("update of a missing attribute: " <> show badUpdate) (isLeft badUpdate)
+    badInsert <- executeDatabaseContextExpr sess conn (Insert "event" (RelationVariable "nosuchrelvar" ()))
+    assertBool ("insert of an invalid relation: " <> show badInsert) (isLeft badInsert)
+    dirty <- disconnectedTransactionIsDirty sess conn
+    assertEqual "rejected statements change nothing" (Right False) dirty
+    run sess conn (insertEvent 7)
+    assertIOEither $ commit sess conn
+    stored <- eventIsStored conn
+    assertBool "the relation variable still holds its tuples" stored
+    remaining <- assertIOEither (executeRelationalExpr sess conn (RelationVariable "event" ()))
+    assertEqual "events" (mkRelationFromList eventAttrs [[IntegerAtom i, TextAtom payload] | (i, payload) <- [(1, "created"), (2, "updated"), (4, "created"), (5, "created"), (6, "created"), (7, "created")]]) (Right remaining)
+
+    -- every reference to an earlier transaction names the transaction which holds the value
+    graph <- transactionGraph_ conn
+    let holds :: String -> (Transaction -> ValueMarker a) -> Transaction -> Assertion
+        holds fieldName field trans =
+          case field trans of
+            ValueMarker _ -> pure ()
+            NotChangedSinceMarker tid ->
+              case transactionForId tid graph of
+                Right origin | valueIsUpdated (field origin) -> pure ()
+                _ -> assertFailure (fieldName <> " of " <> show (transactionId trans) <> " refers to " <> show tid <> " which does not hold the value")
+        contextField field = field . T.concreteDatabaseContext
+    assertBool "enough transactions" (length (transactionListForGraph graph) >= 8)
+    forM_ (transactionListForGraph graph) $ \trans -> do
+      holds "relationVariables" (contextField relationVariables) trans
+      holds "inclusionDependencies" (contextField DBT.inclusionDependencies) trans
+      holds "atomFunctions" (contextField atomFunctions) trans
+      holds "dbcFunctions" (contextField dbcFunctions) trans
+      holds "notifications" (contextField notifications) trans
+      holds "typeConstructorMapping" (contextField DBT.typeConstructorMapping) trans
+      holds "registeredQueries" (contextField registeredQueries) trans
+      holds "acl" (contextField acl) trans
+      holds "subschemas" T.subschemas trans
+
+    -- a session which comes to rest on a transaction has changed nothing
+    assertIOEither $ executeTransactionGraphExpr sess conn (JumpToHead "master")
+    dirtyAfterJump <- disconnectedTransactionIsDirty sess conn
+    assertEqual "not dirty after a jump" (Right False) dirtyAfterJump
+    close conn
+
+    -- and all of it survives reopening
+    conn' <- assertIOEither $ connectProjectM36 connInfo
+    stored' <- eventIsStored conn'
+    assertBool "the relation variable holds its tuples after reopening" stored'
     close conn'
 
 -- the remains of an interrupted write at the end of the log are ignored and replaced by the next commit

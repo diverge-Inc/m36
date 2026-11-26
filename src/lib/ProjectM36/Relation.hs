@@ -128,7 +128,7 @@ degree :: Relation -> Int
 degree = arity
 
 cardinality :: Relation -> RelationCardinality --we need to detect infinite tuple sets- perhaps with a flag
-cardinality (Relation _ (TupleStore _ size _ _)) = Finite size
+cardinality (Relation _ (StoredTuples store)) = Finite (storeSize store)
 cardinality (Relation _ tupSet) = Finite (length (asList tupSet))
 
 --find tuples where the atoms in the relation which are NOT in the AttributeNameSet are equal

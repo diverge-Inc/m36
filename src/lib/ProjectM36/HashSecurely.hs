@@ -279,15 +279,12 @@ data DatabaseContextRelativeTo = DatabaseContextRelativeTo RelationVariables Dat
 instance HashBytes DatabaseContextRelativeTo where
   hashBytes (DatabaseContextRelativeTo baseRelVars db) ctx =
     hashBytesL ctx "DatabaseContext" [SHash (inclusionDependencies db),
-                                      SHash (relVarsHash (relationVariables db)),
+                                      SHash (relVarsDelta baseRelVars <$> relationVariables db),
                                       SHash (notifications db),
                                       SHash (typeConstructorMapping db),
                                       SHash (atomFunctions db),
                                       SHash (dbcFunctions db)
                                      ]
-    where
-      relVarsHash (NotChangedSinceMarker tid) = NotChangedSinceMarker tid
-      relVarsHash (ValueMarker rvs) = ValueMarker (relVarsDelta baseRelVars rvs)
 
 instance HashBytes RelVarsDelta where
   hashBytes delta ctx = hashBytesL ctx "RelVarsDelta" (map SHash delta)
@@ -319,7 +316,7 @@ instance HashBytes InclusionDependencies where
 
 instance HashBytes RelationVariables where
   hashBytes rvs ctx =
-    hashBytesL ctx "RelationVariables" (map SHash (M.toAscList rvs))
+    hashBytesL ctx "RelationVariables" (map (SHash . fmap relVarExpr) (M.toAscList rvs))
 
 instance HashBytes Notifications where
   hashBytes nots ctx =

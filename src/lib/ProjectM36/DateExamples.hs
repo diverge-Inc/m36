@@ -28,9 +28,9 @@ dateExamples = DatabaseContext {
   acl = Identity ACL.basic
   }
   where -- these must be lower case now that data constructors are in play
-    dateRelVars = M.fromList [("s", ExistingRelation suppliers),
-                              ("p", ExistingRelation products),
-                              ("sp", ExistingRelation supplierProducts)]
+    dateRelVars = M.fromList [("s", relVarFromExpr (ExistingRelation suppliers)),
+                              ("p", relVarFromExpr (ExistingRelation products)),
+                              ("sp", relVarFromExpr (ExistingRelation supplierProducts))]
     suppliers = suppliersRel
     products = productsRel
     supplierProducts = supplierProductsRel

@@ -4,6 +4,7 @@ import ProjectM36.Error
 import ProjectM36.Transaction.Persist
 import ProjectM36.TransactionGraph
 import ProjectM36.TransactionGraph.Types
+import qualified ProjectM36.TransactionGraph.Index as TIdx
 import ProjectM36.Transaction.Types
 import ProjectM36.RelationalExpression
 import ProjectM36.Base
@@ -121,7 +122,7 @@ openTransactionLog dbdir = openAppendFile (transactionLogPath dbdir)
 -- | Write an entire transaction graph to storage, replacing the transaction log. Not for use on a database which is open, since open connections keep appending to the log they opened.
 transactionGraphPersist :: DiskSync -> FilePath -> TransactionGraph -> IO LogPosition
 transactionGraphPersist sync destDirectory graph = do
-  let entry = encodeLogEntry (mkLogEntry graph (transactionsForGraph graph))
+  let entry = encodeLogEntry (mkLogEntry graph (transactionListForGraph graph))
       tempPath = destDirectory </> ("." <> transactionLogFileName <> ".tmp")
   writeFileBytesSync sync tempPath entry
   renameSync sync tempPath (transactionLogPath destDirectory)
@@ -130,22 +131,22 @@ transactionGraphPersist sync destDirectory graph = do
 -- | Append the new transactions and the heads of the new graph to the transaction log. The position is how far this process has read the log; anything after it is the remains of an interrupted write and is cut off. Returns the new position. The caller must hold the write lock.
 transactionGraphPersistIncremental :: DiskSync -> AppendFile -> LogPosition -> TransactionGraphIncrementalWriteInfo -> IO LogPosition
 transactionGraphPersistIncremental sync logFile position tgWriteInfo = do
-  let entry = encodeLogEntry (mkLogEntry (newGraph tgWriteInfo) (S.map _uncommittedTransaction (uncommittedTransactions tgWriteInfo)))
+  let entry = encodeLogEntry (mkLogEntry (newGraph tgWriteInfo) (map _uncommittedTransaction (S.toAscList (uncommittedTransactions tgWriteInfo))))
   size <- appendFileSize logFile
   when (size > position) (truncateAppendFile logFile position)
   appendBytesSync sync logFile entry
   pure (position + fromIntegral (BS.length entry))
 
-mkLogEntry :: TransactionGraph -> S.Set Transaction -> LogEntry
+mkLogEntry :: TransactionGraph -> [Transaction] -> LogEntry
 mkLogEntry graph newTransactions =
   LogEntry { leTransactions = map (\trans -> transactionToRecord (firstParentRelationVariables trans graph) trans) (parentsFirst newTransactions),
              leHeads = map (\(headName, trans) -> (headName, transactionId trans)) (M.toList (transactionHeadsForGraph graph)) }
 
 -- | Order transactions so that every transaction comes after its parents (if they are in the set).
-parentsFirst :: S.Set Transaction -> [Transaction]
-parentsFirst transSet = go S.empty (S.toList transSet)
+parentsFirst :: [Transaction] -> [Transaction]
+parentsFirst transList = go S.empty transList
   where
-    ids = S.map transactionId transSet
+    ids = S.fromList (map transactionId transList)
     go _ [] = []
     go emitted remaining =
       let ready trans = all (\pid -> S.member pid emitted || S.notMember pid ids) (NE.toList (parents (transactionInfo trans)))
@@ -214,13 +215,14 @@ applyLogEntry dbdir mScriptSession graphIn entry = do
     addRecord (Right graph) record
       | isRight (transactionForId (trId record) graph) = pure (Right graph) --the transaction is already known and loaded
       | otherwise = do
-          let baseRelVars = case transactionForId (NE.head (parents (trInfo record))) graph of
-                Left _ -> M.empty
-                Right parentTrans -> either (const M.empty) id (resolveDBC' graph (concreteDatabaseContext parentTrans) relationVariables)
-          eTrans <- recordToTransaction dbdir mScriptSession baseRelVars record
+          let mFirstParent = TIdx.lookup (NE.head (parents (trInfo record))) (transactionsForGraph graph)
+              baseRelVars = case mFirstParent of
+                Nothing -> M.empty
+                Just parentTrans -> either (const M.empty) id (resolveDBC' graph (concreteDatabaseContext parentTrans) relationVariables)
+          eTrans <- recordToTransaction dbdir mScriptSession (\tid -> TIdx.lookup tid (transactionsForGraph graph)) mFirstParent baseRelVars record
           pure $ case eTrans of
             Left err -> Left err
-            Right trans -> Right (TransactionGraph (transactionHeadsForGraph graph) (S.insert (withKeyIndexes graph trans) (transactionsForGraph graph)))
+            Right trans -> Right (TransactionGraph (transactionHeadsForGraph graph) (TIdx.insert (withKeyIndexes graph trans) (transactionsForGraph graph)))
 
 -- | Indexes are not stored. A relation variable inherits them from its previous version when its change is applied; this adds the ones which are missing because the relation variable or the key is new in this transaction.
 withKeyIndexes :: TransactionGraph -> Transaction -> Transaction

@@ -16,6 +16,16 @@
   * a statement re-checks only the inclusion dependencies which mention the relation variable it changed
   * transactions are found by id in logarithmic time instead of by scanning all transactions; markers for unchanged subschemas no longer form a chain which grows with every commit
   * behaviour change: a `delete` or `update` which changes no tuple no longer marks the session as dirty
+  * the properties which the speed depends on are carried by types instead of by convention (see "What keeps it that way" in [docs/append_benchmark.markdown](docs/append_benchmark.markdown)):
+    * a relation variable is a `RelVarValue`: either `StoredRelVar` (it holds its tuples in a `TupleStore`) or `DerivedRelVar` (it is defined by an expression). `RelationVariables` maps names to `RelVarValue` instead of to expressions; `relVarExpr` gives the expression which reading a relation variable evaluates
+    * `TransactionGraph` keeps its transactions in a `TransactionIndex` keyed by transaction id (`ProjectM36.TransactionGraph.Index`) instead of a `Set`; use `transactionListForGraph` and `transactionIdsForGraph` to enumerate them
+    * `NotChangedSinceMarker` can be matched on but not applied; a reference to an earlier transaction is made with `unchangedSince` from the marker of that transaction, so it always names the transaction which holds the value. A session's workspace is based on a transaction with `DisconnectedTransaction.fromTransaction` (which replaces `freshTransaction`)
+    * `ptrEquals` (`ProjectM36.PointerEquality`) only accepts evaluated values
+    * the indexes of a `TupleStore` are a strict list (`TupleStoreIndexes`), so an index is updated when a tuple changes instead of when the index is next used
+    * the materialized constructor of `RelationTupleSet` is now `StoredTuples TupleStore`
+  * behaviour change: `insert`, `update` and `delete` on a relation variable which holds its tuples fail right away if their result cannot be evaluated (for example a `delete` whose predicate names a missing attribute); such a statement used to be stored as an expression and fail whenever the relation variable was read
+  * behaviour change: a session is not dirty after jumping to a head or a transaction, and after a merge it is based on the merge transaction
+  * merging two branches keeps a relation variable which holds the same tuples in both as it is, and merges relation variables which hold their tuples into one which holds their union (instead of defining the merged relation variable by a union expression)
   * drop the `linux-xattr` dependency (extended attributes were only written for the removed per-relation-variable files)
 
 # ? (v1.2.7)

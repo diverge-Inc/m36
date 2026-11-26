@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveGeneric, DeriveAnyClass, BangPatterns #-}
+{-# LANGUAGE DeriveGeneric, DeriveAnyClass #-}
 -- | The change of the relation variables of a transaction relative to its first parent.
 --
 -- Both the Merkle hash of a transaction and its on-disk record are defined over this delta rather than over the complete set of relation variables, so that committing costs time and space proportional to what the transaction changed.
@@ -7,7 +7,8 @@
 module ProjectM36.RelationVariablesDelta where
 import ProjectM36.Base
 import ProjectM36.TupleStore
-import qualified Data.Map as M
+import ProjectM36.PointerEquality
+import qualified Data.Map.Strict as M
 import qualified Data.Map.Merge.Strict as MM
 import qualified Data.HashSet as HS
 import GHC.Generics (Generic)
@@ -16,11 +17,11 @@ import Control.DeepSeq (NFData)
 data RelVarChange =
   -- | The relation variable no longer exists.
   RelVarRemoved |
-  -- | The relation variable is now defined by this expression (it is not a materialized relation).
+  -- | The relation variable is now defined by this expression ('DerivedRelVar').
   RelVarExpr GraphRefRelationalExpr |
-  -- | The relation variable is now this materialized relation; the atom vectors are in the order of the attributes.
+  -- | The relation variable now holds these tuples ('StoredRelVar'); the atom vectors are in the order of the attributes.
   RelVarFull Attributes [AtomVector] |
-  -- | The relation variable is the materialized relation of the same name in the first parent plus the first tuples and minus the second tuples.
+  -- | The relation variable holds the tuples of the relation variable of the same name in the first parent plus the first tuples and minus the second tuples.
   RelVarDelta [AtomVector] [AtomVector]
   deriving (Show, Generic, NFData)
 
@@ -32,29 +33,26 @@ relVarsDelta :: RelationVariables -> RelationVariables -> RelVarsDelta
 relVarsDelta base new =
   M.toAscList $ MM.merge
     (MM.mapMissing (\_ _ -> RelVarRemoved))
-    (MM.mapMissing (\_ expr -> fresh expr))
-    (MM.zipWithMaybeMatched (\_ baseExpr newExpr -> changed baseExpr newExpr))
+    (MM.mapMissing (\_ rv -> fresh rv))
+    (MM.zipWithMaybeMatched (\_ baseRv newRv -> changed baseRv newRv))
     base new
   where
-    fresh (ExistingRelation (Relation _ (TupleStore attrs _ tups _))) = RelVarFull attrs (HS.toList tups)
-    fresh expr = RelVarExpr expr
-    changed !baseExpr !newExpr | ptrEquals baseExpr newExpr = Nothing
-    changed (ExistingRelation (Relation _ (TupleStore baseAttrs _ baseTups _))) newExpr@(ExistingRelation (Relation _ (TupleStore attrs size tups _)))
-      | attributesVec baseAttrs == attributesVec attrs =
-          case storeDiff baseTups tups of
+    fresh (StoredRelVar store) = RelVarFull (storeAttributes store) (HS.toList (storeTuples store))
+    fresh (DerivedRelVar expr) = RelVarExpr expr
+    -- a relation variable which the transaction did not touch is the very same value as in the parent
+    changed baseRv newRv | ptrEquals (Forced baseRv) (Forced newRv) = Nothing
+    changed (StoredRelVar baseStore) newRv@(StoredRelVar store)
+      | attributesVec (storeAttributes baseStore) == attributesVec (storeAttributes store) =
+          case storeDiff (storeTuples baseStore) (storeTuples store) of
             ([], []) -> Nothing
-            (removed, added) | length removed + length added <= size -> Just (RelVarDelta added removed)
-                             | otherwise -> Just (fresh newExpr)
-    changed baseExpr newExpr | isMaterializedExpr newExpr = Just (fresh newExpr)
-                             | baseExpr == newExpr = Nothing
-                             | otherwise = Just (RelVarExpr newExpr)
-
-isMaterializedExpr :: RelationalExprBase a -> Bool
-isMaterializedExpr (ExistingRelation (Relation _ TupleStore{})) = True
-isMaterializedExpr _ = False
+            (removed, added) | length removed + length added <= storeSize store -> Just (RelVarDelta added removed)
+                             | otherwise -> Just (fresh newRv)
+    changed _ newRv@StoredRelVar{} = Just (fresh newRv)
+    changed baseRv newRv@(DerivedRelVar newExpr) | baseRv == newRv = Nothing
+                                                 | otherwise = Just (RelVarExpr newExpr)
 
 -- | Inverse of 'relVarsDelta': apply the changes to the relation variables of the first parent.
--- Unchanged relation variables are shared with the parent, and changed materialized relations share structure with their previous version.
+-- Unchanged relation variables are shared with the parent, and changed stores share structure with their previous version.
 applyRelVarsDelta :: RelationVariables -> RelVarsDelta -> Either String RelationVariables
 applyRelVarsDelta = foldl apply . Right
   where
@@ -62,10 +60,10 @@ applyRelVarsDelta = foldl apply . Right
     apply (Right rvs) (name, change) =
       case change of
         RelVarRemoved -> Right (M.delete name rvs)
-        RelVarExpr expr -> Right (M.insert name expr rvs)
-        RelVarFull attrs vecs -> Right (M.insert name (ExistingRelation (Relation attrs (storeFromVectors attrs vecs))) rvs)
+        RelVarExpr expr -> Right (M.insert name (DerivedRelVar expr) rvs)
+        RelVarFull attrs vecs -> Right (M.insert name (StoredRelVar (storeFromVectors attrs vecs)) rvs)
         RelVarDelta added removed ->
           case M.lookup name rvs of
-            Just (ExistingRelation (Relation attrs store@TupleStore{})) ->
-              Right (M.insert name (ExistingRelation (Relation attrs (storeInsertVectors (storeDeleteVectors store removed) added))) rvs)
-            _ -> Left ("relation variable delta without a materialized base: " <> show name)
+            Just (StoredRelVar store) ->
+              Right (M.insert name (StoredRelVar (storeInsertVectors (storeDeleteVectors store removed) added)) rvs)
+            _ -> Left ("relation variable delta without a stored base: " <> show name)

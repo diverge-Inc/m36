@@ -57,8 +57,8 @@ testIsoRename = TestCase $ do
   -- create a schema with two relvars and rename one while the other remains the same in the isomorphic schema
   let ctx = DBC.empty { 
         relationVariables = ValueMarker $
-          M.fromList [("employee", ExistingRelation relationTrue), 
-                      ("department", ExistingRelation relationFalse)]
+          M.fromList [("employee", relVarFromExpr (ExistingRelation relationTrue)), 
+                      ("department", relVarFromExpr (ExistingRelation relationFalse))]
         }
   (graph, _) <- freshTransactionGraph ctx
   let isomorphsAtoB = [IsoRename "emp" "employee", 
@@ -87,8 +87,8 @@ testIsoRestrict = TestCase $ do
             
   let schemaA = mkRelationalExprEnv baseContext graph
       baseContext = DBC.empty {
-        relationVariables = ValueMarker $ M.fromList [("nonboss", ExistingRelation nonBossRel),
-                                        ("boss", ExistingRelation bossRel)]
+        relationVariables = ValueMarker $ M.fromList [("nonboss", relVarFromExpr (ExistingRelation nonBossRel)),
+                                        ("boss", relVarFromExpr (ExistingRelation bossRel))]
         }
       isomorphsAtoB = [IsoRestrict "employee" predicate ("boss", "nonboss")]
       schemaB = Schema isomorphsAtoB
@@ -143,7 +143,7 @@ testIsoUnion = TestCase $ do
                 [TextAtom "Auto", IntegerAtom 200],
                 [TextAtom "Tractor", IntegerAtom 500]]
   let env = mkRelationalExprEnv (toDatabaseContext $ DBC.basicDatabaseContext {
-        relationVariables = Identity $ M.singleton "motor" (ExistingRelation motorsRel)
+        relationVariables = Identity $ M.singleton "motor" (relVarFromExpr (ExistingRelation motorsRel))
         }
         ) graph
       splitPredicate = AtomExprPredicate (FunctionAtomExpr "lt" [AttributeAtomExpr "power", NakedAtomExpr (IntegerAtom 50)] ())

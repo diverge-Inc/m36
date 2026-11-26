@@ -84,29 +84,54 @@ transactionToRecord baseRelVars trans =
     marker (ValueMarker val) = Right val
     marker (NotChangedSinceMarker tid) = Left tid
 
--- | Rebuild a transaction from its stored form. The first argument is the database directory (to find compiled modules) and the third is the relation variables of the transaction's first parent.
-recordToTransaction :: FilePath -> Maybe ScriptSession -> RelationVariables -> TransactionRecord -> IO (Either PersistenceError Transaction)
-recordToTransaction dbdir mScriptSession baseRelVars record = do
+-- | Rebuild a transaction from its stored form. The first argument is the database directory (to find compiled modules), the third finds the transactions loaded so far, the fourth is the transaction's first parent (if it has one), and the fifth is the relation variables of that parent.
+--
+-- A part stored as the id of an earlier transaction becomes a reference to that transaction, which must hold the value itself.
+recordToTransaction :: FilePath -> Maybe ScriptSession -> (TransactionId -> Maybe Transaction) -> Maybe Transaction -> RelationVariables -> TransactionRecord -> IO (Either PersistenceError Transaction)
+recordToTransaction dbdir mScriptSession lookupTransaction mFirstParent baseRelVars record = do
   let objFilesDir = objectFilesPath dbdir
-      marker :: Either TransactionId a -> ValueMarker a
-      marker = either NotChangedSinceMarker ValueMarker
-      loadMarker :: Default acl => HS.HashSet (Function a acl) -> Either TransactionId [FunctionRecord] -> IO (ValueMarker (HS.HashSet (Function a acl)))
-      loadMarker _ (Left tid) = pure (NotChangedSinceMarker tid)
-      loadMarker precompiled (Right funcRecords) = ValueMarker <$> loadFuncs objFilesDir precompiled mScriptSession funcRecords
+      reference :: (Transaction -> ValueMarker a) -> TransactionId -> Either PersistenceError (ValueMarker a)
+      reference field tid
+        -- the usual case: the first parent refers to the same transaction, so its marker is the one wanted and nothing has to be looked up
+        | Just parent <- mFirstParent, parentMarker@(NotChangedSinceMarker origin) <- field parent, origin == tid = Right parentMarker
+        | otherwise =
+            case lookupTransaction tid of
+              Nothing -> Left (MissingTransactionError tid)
+              Just origin ->
+                case field origin of
+                  originMarker@ValueMarker{} -> Right (unchangedSince tid originMarker)
+                  NotChangedSinceMarker{} -> Left (CorruptTransactionError (trId record) ("reference to transaction " <> show tid <> " which does not hold the value"))
+      marker :: (Transaction -> ValueMarker a) -> Either TransactionId a -> Either PersistenceError (ValueMarker a)
+      marker field = either (reference field) (Right . ValueMarker)
+      contextField :: (DatabaseContext -> ValueMarker a) -> Transaction -> ValueMarker a
+      contextField field = field . concreteDatabaseContext
+      loadMarker :: Default acl => (Transaction -> ValueMarker (HS.HashSet (Function a acl))) -> HS.HashSet (Function a acl) -> Either TransactionId [FunctionRecord] -> IO (Either PersistenceError (ValueMarker (HS.HashSet (Function a acl))))
+      loadMarker field _ (Left tid) = pure (reference field tid)
+      loadMarker _ precompiled (Right funcRecords) = Right . ValueMarker <$> loadFuncs objFilesDir precompiled mScriptSession funcRecords
   case traverse (applyRelVarsDelta baseRelVars) (trRelationVariables record) of
     Left err -> pure (Left (CorruptTransactionError (trId record) err))
     Right relvars -> do
-      atomFuncs <- loadMarker precompiledAtomFunctions (trAtomFunctions record)
-      dbcFuncs <- loadMarker basicDatabaseContextFunctions (trDbcFunctions record)
-      let context = DatabaseContext { inclusionDependencies = marker (trInclusionDependencies record),
-                                      relationVariables = marker relvars,
-                                      typeConstructorMapping = marker (trTypeConstructorMapping record),
-                                      notifications = marker (trNotifications record),
-                                      atomFunctions = atomFuncs,
-                                      dbcFunctions = dbcFuncs,
-                                      registeredQueries = marker (trRegisteredQueries record),
-                                      acl = marker (trAcl record) }
-      pure (Right (Transaction (trId record) (trInfo record) (Schemas context (marker (trSubschemas record)))))
+      eAtomFuncs <- loadMarker (contextField atomFunctions) precompiledAtomFunctions (trAtomFunctions record)
+      eDbcFuncs <- loadMarker (contextField dbcFunctions) basicDatabaseContextFunctions (trDbcFunctions record)
+      pure $ do
+        atomFuncs <- eAtomFuncs
+        dbcFuncs <- eDbcFuncs
+        incDeps <- marker (contextField inclusionDependencies) (trInclusionDependencies record)
+        relvars' <- marker (contextField relationVariables) relvars
+        tConsMap <- marker (contextField typeConstructorMapping) (trTypeConstructorMapping record)
+        notifs <- marker (contextField notifications) (trNotifications record)
+        regQueries <- marker (contextField registeredQueries) (trRegisteredQueries record)
+        acl' <- marker (contextField acl) (trAcl record)
+        sschemas <- marker subschemas (trSubschemas record)
+        let context = DatabaseContext { inclusionDependencies = incDeps,
+                                        relationVariables = relvars',
+                                        typeConstructorMapping = tConsMap,
+                                        notifications = notifs,
+                                        atomFunctions = atomFuncs,
+                                        dbcFunctions = dbcFuncs,
+                                        registeredQueries = regQueries,
+                                        acl = acl' }
+        pure (Transaction (trId record) (trInfo record) (Schemas context sschemas))
 
 functionRecords :: [Function a acl] -> [FunctionRecord]
 functionRecords = map functionData

@@ -54,9 +54,11 @@ The transaction log is append-only. Every commit (and every other change to the 
 
 An entry is framed as a 4 byte big-endian payload length, the first 8 bytes of the SHA-256 of the payload, and the payload (a `LogEntry` serialised with winery). An incomplete or damaged entry at the end of the log (the remains of a write which was interrupted by a crash) is ignored when reading and cut off before the next entry is appended. With `CrashSafePersistence` the log is `fsync`ed before a commit returns.
 
-A transaction is stored as a `TransactionRecord`. As in memory, every part of the database context (inclusion dependencies, functions, types, notifications, registered queries, access control lists, subschemas) is either its value or the id of the earlier transaction since which it has not changed. The relation variables are stored as their change relative to the first parent of the transaction (`RelVarsDelta`): removed relation variables, relation variables with a new defining expression, and, for materialized relation variables, either all tuples or the tuples added and removed. The size of an entry therefore depends on what the commit changed, not on the size of the database or the length of its history.
+A transaction is stored as a `TransactionRecord`. As in memory, every part of the database context (inclusion dependencies, functions, types, notifications, registered queries, access control lists, subschemas) is either its value or the id of the earlier transaction since which it has not changed. The relation variables are stored as their change relative to the first parent of the transaction (`RelVarsDelta`): removed relation variables, relation variables with a new defining expression, and, for relation variables which hold their tuples, either all tuples or the tuples added and removed. The size of an entry therefore depends on what the commit changed, not on the size of the database or the length of its history.
 
 The Merkle hash of a transaction is computed over the same change, so that it can be computed and validated in time proportional to the change. The unchanged relation variables are covered through the hashes of the parents.
+
+The id stored for an unchanged part always names the transaction which holds the value, never a transaction which itself only refers to an earlier one, so finding the value is a single lookup however long the history is. A log in which such an id names a transaction which does not hold the value is refused as corrupt.
 
 ### Multiple processes
 
