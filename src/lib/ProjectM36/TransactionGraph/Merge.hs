@@ -6,6 +6,7 @@ import ProjectM36.Error
 import ProjectM36.ValueMarker
 import ProjectM36.TransactionGraph.Types
 import ProjectM36.RelationalExpression
+import qualified ProjectM36.RelVarValue as RV
 import ProjectM36.DatabaseContext.Types
 import ProjectM36.AccessControlList
 import ProjectM36.DatabaseContext.Fields
@@ -48,19 +49,25 @@ unionMergeMaps field prefer graph f v_mapA v_mapB = do
                          Left (MergeTransactionError (StrategyViolatesComponentMergeError field violatingKey))
                      
 -- perform the merge even if the attributes are different- is this what we want? Obviously, we need finer-grained merge options.
-unionMergeRelation :: MergePreference -> GraphRefRelationalExpr -> GraphRefRelationalExpr -> GraphRefRelationalExprM GraphRefRelationalExpr
-unionMergeRelation prefer relA relB = do
-  let unioned = Union relA relB
+unionMergeRelation :: MergePreference -> RelVarValue -> RelVarValue -> GraphRefRelationalExprM RelVarValue
+-- both branches hold the same tuples (typically because neither changed the relation variable): there is nothing to merge, and the value stays shared with the branches
+unionMergeRelation _prefer rvA rvB | RV.sameTuples rvA rvB = pure rvA
+unionMergeRelation prefer rvA rvB = do
+  let unioned = Union (relVarExpr rvA) (relVarExpr rvB)
       mergeErr e = MergeTransactionError (StrategyViolatesRelationVariableMergeError e)
       preferredRelVar =
         case prefer of
-          PreferFirst -> pure relA
-          PreferSecond -> pure relB
+          PreferFirst -> pure rvA
+          PreferSecond -> pure rvB
           PreferNeither -> throwError (MergeTransactionError StrategyWithoutPreferredBranchResolutionMergeError)
       handler AttributeNamesMismatchError{} = preferredRelVar
       handler err' = throwError (mergeErr err')
+      -- two relation variables which hold their tuples merge into one which holds the union; otherwise the merged relation variable is defined by the union of the expressions
+      merged rel
+        | RV.holdsTuples rvA && RV.holdsTuples rvB, Just held <- RV.holdingLike rvA rel = held
+        | otherwise = DerivedRelVar unioned
   --typecheck first?
-  (evalGraphRefRelationalExpr unioned >> pure (Union relA relB)) `catchError` handler
+  (merged <$> evalGraphRefRelationalExpr unioned) `catchError` handler
 
 --try to execute unions against the relvars contents -- if a relvar only appears in one context, include it
 unionMergeRelVars ::

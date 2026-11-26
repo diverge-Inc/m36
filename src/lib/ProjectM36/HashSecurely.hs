@@ -17,6 +17,8 @@ import qualified ProjectM36.DataConstructorDef as DC
 import ProjectM36.MerkleHash
 import ProjectM36.ValueMarker
 import Data.List (sortOn)
+import qualified Data.List as L
+import ProjectM36.RelationVariablesDelta
 import qualified Data.Map as M
 import qualified ProjectM36.TypeConstructorDef as TCons
 import qualified Crypto.Hash.SHA256 as SHA256
@@ -271,6 +273,37 @@ instance HashBytes DatabaseContext where
                                       SHash (dbcFunctions db)
                                      ]
   
+-- | A database context whose relation variables are hashed as the change relative to the given relation variables.
+data DatabaseContextRelativeTo = DatabaseContextRelativeTo RelationVariables DatabaseContext
+
+instance HashBytes DatabaseContextRelativeTo where
+  hashBytes (DatabaseContextRelativeTo baseRelVars db) ctx =
+    hashBytesL ctx "DatabaseContext" [SHash (inclusionDependencies db),
+                                      SHash (relVarsDelta baseRelVars <$> relationVariables db),
+                                      SHash (notifications db),
+                                      SHash (typeConstructorMapping db),
+                                      SHash (atomFunctions db),
+                                      SHash (dbcFunctions db)
+                                     ]
+
+instance HashBytes RelVarsDelta where
+  hashBytes delta ctx = hashBytesL ctx "RelVarsDelta" (map SHash delta)
+
+instance HashBytes RelVarChange where
+  hashBytes RelVarRemoved ctx = SHA256.update ctx "RelVarRemoved"
+  hashBytes (RelVarExpr expr) ctx = hashBytesL ctx "RelVarExpr" [SHash expr]
+  hashBytes (RelVarFull attrs vecs) ctx = hashBytesL ctx "RelVarFull" [SHash attrs, SHash (AtomVectorSet vecs)]
+  hashBytes (RelVarDelta added removed) ctx = hashBytesL ctx "RelVarDelta" [SHash (AtomVectorSet added), SHash (AtomVectorSet removed)]
+
+-- | A set of atom vectors hashed independently of the order in which they are listed: each vector is hashed by itself and the digests are hashed in sorted order.
+newtype AtomVectorSet = AtomVectorSet [V.Vector Atom]
+
+instance HashBytes AtomVectorSet where
+  hashBytes (AtomVectorSet vecs) ctx =
+    L.foldl' SHA256.update (SHA256.update ctx "AtomVectorSet") (L.sort (map digest vecs))
+    where
+      digest vec = SHA256.finalize (hashBytesL SHA256.init "AtomVector" (V.map SHash vec))
+
 instance HashBytes a => HashBytes (ValueMarker a) where 
   hashBytes (ValueMarker a) ctx =
     hashBytesL ctx "ValueMarker" [SHash a]
@@ -283,7 +316,7 @@ instance HashBytes InclusionDependencies where
 
 instance HashBytes RelationVariables where
   hashBytes rvs ctx =
-    hashBytesL ctx "RelationVariables" (map SHash (M.toAscList rvs))
+    hashBytesL ctx "RelationVariables" (map (SHash . fmap relVarExpr) (M.toAscList rvs))
 
 instance HashBytes Notifications where
   hashBytes nots ctx =
@@ -357,14 +390,15 @@ instance HashBytes Subschemas where
     hashBytesL ctx "subschemas" (map SHash (M.toAscList m))
 
 -- | Hash a transaction within its graph context to create a Merkle hash for it.
-hashTransaction :: Transaction -> S.Set Transaction -> MerkleHash
-hashTransaction trans parentTranses = MerkleHash (SHA256.finalize newHash)
+-- | Hash a transaction. The relation variables enter the hash as their change relative to the relation variables of the first parent (the third argument), so hashing costs time proportional to what the transaction changed. The content of the unchanged relation variables is covered by the Merkle hashes of the parents.
+hashTransaction :: Transaction -> S.Set Transaction -> RelationVariables -> MerkleHash
+hashTransaction trans parentTranses baseRelVars = MerkleHash (SHA256.finalize newHash)
   where
     newHash = hashBytesL SHA256.init "Transaction" (map SHash transIds <>
                                          map SHash parentMerkleHashes <>
                                          [SHash tstamp,
                                          SHash (subschemas trans),
-                                         SHash (concreteDatabaseContext trans)]
+                                         SHash (DatabaseContextRelativeTo baseRelVars (concreteDatabaseContext trans))]
                                                    )
     tstamp = stamp (transactionInfo trans)
     parentMerkleHashes = map getMerkleHash (S.toAscList parentTranses)

@@ -7,6 +7,28 @@
 * macOS: read memory statistics with `sysctl` instead of spawning `memory_pressure` on every query; fixes queries failing when `/usr/bin` is not on `PATH` and the free-memory estimate on 16 KiB-page (Apple Silicon) machines
 * drop `-fexternal-interpreter` from the library, which made GHC 9.10 panic while running Template Haskell
 * run the full test suite in the Nix build (previously disabled)
+* make the cost of a commit independent of the size of the database and the length of its history (see [docs/append_benchmark.markdown](docs/append_benchmark.markdown) for measurements against PostgreSQL):
+  * **new on-disk format (version 9); databases written by earlier versions cannot be opened** (as with previous format changes, there is no migration)
+  * the transaction graph is persisted as one append-only transaction log instead of a directory per transaction; a commit appends the change of the transaction relative to its parent (see [docs/filesystem-persistence.markdown](docs/filesystem-persistence.markdown))
+  * the value of a relation variable is kept as a materialized relation in a persistent (structure-sharing) set; `insert`, `delete` and `update` are applied to the value right away instead of piling up as an expression which grows with every statement
+  * the Merkle hash of a transaction covers the change of the relation variables relative to the first parent instead of all relation variables, so hashing and validating cost time proportional to the changes; hashes therefore differ from those of earlier versions
+  * uniqueness constraints made with `databaseContextExprForUniqueKey`/`inclusionDependencyForKey` (TutorialD `key`) are backed by an index: they are checked without evaluating the constraint, and restrictions which compare the key attributes with constants find their tuples through the index
+  * a statement re-checks only the inclusion dependencies which mention the relation variable it changed
+  * transactions are found by id in logarithmic time instead of by scanning all transactions; markers for unchanged subschemas no longer form a chain which grows with every commit
+  * behaviour change: a `delete` or `update` which changes no tuple no longer marks the session as dirty
+  * the properties which the speed depends on are carried by types instead of by convention (see "What keeps it that way" in [docs/append_benchmark.markdown](docs/append_benchmark.markdown)):
+    * a relation variable is a `RelVarValue`: either `StoredRelVar` (it holds its tuples in a `TupleStore`) or `DerivedRelVar` (it is defined by an expression). `RelationVariables` maps names to `RelVarValue` instead of to expressions; `relVarExpr` gives the expression which reading a relation variable evaluates
+    * `TransactionGraph` keeps its transactions in a `TransactionIndex` keyed by transaction id (`ProjectM36.TransactionGraph.Index`) instead of a `Set`; use `transactionListForGraph` and `transactionIdsForGraph` to enumerate them
+    * `NotChangedSinceMarker` can be matched on but not applied; a reference to an earlier transaction is made with `unchangedSince` from the marker of that transaction, so it always names the transaction which holds the value. A session's workspace is based on a transaction with `DisconnectedTransaction.fromTransaction` (which replaces `freshTransaction`)
+    * `ptrEquals` (`ProjectM36.PointerEquality`) only accepts evaluated values
+    * the indexes of a `TupleStore` are a strict list (`TupleStoreIndexes`), so an index is updated when a tuple changes instead of when the index is next used
+    * the materialized constructor of `RelationTupleSet` is now `StoredTuples TupleStore`
+  * the optimizations are kept out of the relational logic: `insert`, `update` and `delete` are defined as upstream defines them (the assignment of an expression over the current value, now evaluated right away), and what makes them cheap is in the relational operators (`union`, `restrictByPredicate`), in `ProjectM36.RelVarValue`, and behind the five functions of `ProjectM36.OptimizationHooks`, each of which has a trivial implementation that is always correct. `test-statement-model` checks the statements against a model which knows nothing of these layers (see "How the optimizations are layered" in [docs/append_benchmark.markdown](docs/append_benchmark.markdown))
+  * a union of a relation with one which holds its tuples in a store has the order of attributes of the latter, whichever operand it is
+  * behaviour change: `insert`, `update` and `delete` on a relation variable which holds its tuples fail right away if their result cannot be evaluated (for example a `delete` whose predicate names a missing attribute); such a statement used to be stored as an expression and fail whenever the relation variable was read
+  * behaviour change: a session is not dirty after jumping to a head or a transaction, and after a merge it is based on the merge transaction
+  * merging two branches keeps a relation variable which holds the same tuples in both as it is, and merges relation variables which hold their tuples into one which holds their union (instead of defining the merged relation variable by a union expression)
+  * drop the `linux-xattr` dependency (extended attributes were only written for the removed per-relation-variable files)
 
 # ? (v1.2.7)
 

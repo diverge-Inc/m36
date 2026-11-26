@@ -7,6 +7,8 @@ import qualified Data.Vector as V
 import ProjectM36.Base
 import ProjectM36.Tuple
 import qualified ProjectM36.TupleSet as TS
+import qualified ProjectM36.TupleStore as TStore
+import qualified Data.Map as M
 import qualified ProjectM36.Attribute as A
 import ProjectM36.TupleSet
 import ProjectM36.Error
@@ -93,9 +95,12 @@ union (Relation attrs1 tupSet1) (Relation attrs2 tupSet2)
   | not (A.attributesEqual attrs1 attrs2) =
     Left $ AttributeTypesMismatchError $ A.attributesDifference attrs1 attrs2
   | otherwise =
-    Right $ Relation attrs1 newtuples
+    Right $ Relation targetAttrs (tupleSetUnion targetAttrs tupSet1 tupSet2)
   where
-    newtuples = tupleSetUnion attrs1 tupSet1 tupSet2
+    -- the result has the order of attributes of the first relation, unless only the second one holds its tuples in a store: then the result has the order of that one, so that the union can be made by adding to the store whichever way round the operands are
+    targetAttrs = case (tupSet1, tupSet2) of
+      (TupleList{}, StoredTuples{}) -> attrs2
+      _ -> attrs1
 
 project :: S.Set AttributeName -> Relation -> Either RelationalError Relation
 project attrNames rel@(Relation _ tupSet) = do
@@ -128,6 +133,7 @@ degree :: Relation -> Int
 degree = arity
 
 cardinality :: Relation -> RelationCardinality --we need to detect infinite tuple sets- perhaps with a flag
+cardinality (Relation _ (StoredTuples store)) = Finite (storeSize store)
 cardinality (Relation _ tupSet) = Finite (length (asList tupSet))
 
 --find tuples where the atoms in the relation which are NOT in the AttributeNameSet are equal
@@ -242,6 +248,47 @@ restrict :: RestrictionFilter -> Relation -> Either RelationalError Relation
 restrict rfilter (Relation attrs tupset) = do
   tuples <- filterM (`rfilter` mempty) (asList tupset)
   Right $ Relation attrs (RelationTupleSet tuples)
+
+-- | 'restrict' for a filter which implements the given predicate. The result is that of @restrict rfilter rel@; the predicate is only used to do less work when the relation holds its tuples in a store:
+--
+-- * if the predicate requires indexed attributes to equal constants, only the tuples found through the index are examined
+-- * if the predicate is a negation, the tuples which it rejects are removed from the store, so that the result is a store which shares everything else with the relation
+--
+-- (A tuple which is not examined is not run through the filter, so a filter which would fail for such a tuple does not make the restriction fail.)
+restrictByPredicate :: RestrictionPredicateExprBase a -> RestrictionFilter -> Relation -> Either RelationalError Relation
+restrictByPredicate predicate rfilter rel@(Relation attrs (StoredTuples store)) =
+  case predicate of
+    NotPredicate inner ->
+      case TStore.storeLookupByEqualities (predicateEqualities inner) store of
+        -- only these tuples can satisfy the inner predicate, so only they can be rejected
+        Just candidates -> without <$> filterM (fmap not . accepts) candidates
+        Nothing -> do
+          verdicts <- mapM (\tup -> (,) tup <$> accepts tup) (TStore.storeTupleList store)
+          let rejected = [tup | (tup, False) <- verdicts]
+          pure $ if 2 * length rejected <= storeSize store then
+                   without rejected
+                 else
+                   -- most tuples go: cheaper to start over from the few which stay
+                   Relation attrs (RelationTupleSet [tup | (tup, True) <- verdicts])
+    _ -> case TStore.storeLookupByEqualities (predicateEqualities predicate) store of
+           Just candidates -> Relation attrs . RelationTupleSet <$> filterM accepts candidates
+           Nothing -> restrict rfilter rel
+  where
+    accepts tup = rfilter tup mempty
+    without [] = rel
+    without rejected = Relation attrs (StoredTuples (TStore.storeDeleteVectors store (map tupleAtoms rejected)))
+restrictByPredicate _ rfilter rel = restrict rfilter rel
+
+-- | The tuples of the relation which can satisfy the predicate, if that is known to be fewer than all of them (see 'restrictByPredicate'). The predicate still has to be applied to them.
+restrictionCandidates :: RestrictionPredicateExprBase a -> Relation -> Maybe [RelationTuple]
+restrictionCandidates predicate (Relation _ (StoredTuples store)) = TStore.storeLookupByEqualities (predicateEqualities predicate) store
+restrictionCandidates _ _ = Nothing
+
+-- | The attribute = constant terms which every tuple satisfying the predicate must satisfy.
+predicateEqualities :: RestrictionPredicateExprBase a -> M.Map AttributeName Atom
+predicateEqualities (AndPredicate exprA exprB) = M.union (predicateEqualities exprA) (predicateEqualities exprB)
+predicateEqualities (AttributeEqualityPredicate attrName (NakedAtomExpr atom)) = M.singleton attrName atom
+predicateEqualities _ = M.empty
 
 --joins on columns with the same name- use rename to avoid this- base case: cartesian product
 --after changing from string atoms, there needs to be a type-checking step!

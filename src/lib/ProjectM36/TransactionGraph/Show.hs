@@ -14,7 +14,7 @@ showTransactionStructure trans graph = headInfo ++ " " ++ show (transactionId tr
 
   
 showGraphStructure :: TransactionGraph -> String
-showGraphStructure graph@(TransactionGraph _ transSet) = S.foldr folder "" transSet
+showGraphStructure graph = foldr folder "" (transactionListForGraph graph)
   where
     folder trans acc = acc ++ showTransactionStructure trans graph ++ "\n"
     

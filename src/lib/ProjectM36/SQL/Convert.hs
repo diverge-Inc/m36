@@ -1098,7 +1098,7 @@ pushDownAttributeRename renameSet matchExpr targetExpr =
 mkTableContextFromDatabaseContext :: DatabaseContext -> TransactionGraph -> Either RelationalError TableContext
 mkTableContextFromDatabaseContext dbc tgraph = do
   rvs <- resolveDBC' tgraph dbc relationVariables
-  TableContext . M.fromList <$> mapM rvMapper (M.toList rvs)
+  TableContext . M.fromList <$> mapM rvMapper (M.toList (relVarExpr <$> rvs))
   where
     rvMapper (nam, rvexpr) = do
       let gfEnv = freshGraphRefRelationalExprEnv (Just dbc) tgraph

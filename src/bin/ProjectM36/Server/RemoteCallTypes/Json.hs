@@ -38,8 +38,11 @@ instance FromJSON RestrictionPredicateExpr
 instance ToJSON AtomExpr
 instance FromJSON AtomExpr
 
-instance ToJSON RelationTupleSet
-instance FromJSON RelationTupleSet
+-- same JSON as the generic instance of the former newtype: an object with the list of tuples in "asList"
+instance ToJSON RelationTupleSet where
+  toJSON tupSet = object ["asList" .= asList tupSet]
+instance FromJSON RelationTupleSet where
+  parseJSON = withObject "RelationTupleSet" $ \o -> TupleList <$> o .: "asList"
 
 instance ToJSON RelationTuple
 instance FromJSON RelationTuple

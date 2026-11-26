@@ -128,6 +128,11 @@ instance ReferencedTransactionIds a => ReferencedTransactionIds (ValueMarker a) 
   referencedTransactionIds (ValueMarker a) = referencedTransactionIds a
   referencedTransactionIds (NotChangedSinceMarker tid) = S.singleton tid
 
+instance ReferencedTransactionIds RelVarValue where
+  -- stored tuples refer to nothing
+  referencedTransactionIds StoredRelVar{} = S.empty
+  referencedTransactionIds (DerivedRelVar expr) = referencedTransactionIds expr
+
 instance ReferencedTransactionIds RelationVariables where
   referencedTransactionIds relVars =
     S.unions (referencedTransactionIds <$> M.elems relVars)

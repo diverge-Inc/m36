@@ -12,7 +12,7 @@ import qualified Data.Functor.Foldable as Fold
 
 resolvedDatabaseContextAsDatabaseContextExpr :: ResolvedDatabaseContext -> DatabaseContextExpr
 resolvedDatabaseContextAsDatabaseContextExpr context = do
-  let relVarsExprs = map (\(name, rel) -> Assign name (stripGraphRefRelationalExpr rel)) (M.toList relVars)
+  let relVarsExprs = map (\(name, rv) -> Assign name (stripGraphRefRelationalExpr (relVarExpr rv))) (M.toList relVars)
       relVars = runIdentity (relationVariables context)
       incDeps = runIdentity (inclusionDependencies context)
       incDepsExprs = map (uncurry AddInclusionDependency) (M.toList incDeps)
@@ -24,7 +24,7 @@ databaseContextAsDatabaseContextExpr :: DatabaseContext -> TransactionGraph -> E
 databaseContextAsDatabaseContextExpr context graph = do
   relVars <- resolveDBC' graph context relationVariables
   incDeps <- resolveDBC' graph context inclusionDependencies
-  let relVarsExprs = map (\(name, rel) -> Assign name (stripGraphRefRelationalExpr rel)) (M.toList relVars)
+  let relVarsExprs = map (\(name, rv) -> Assign name (stripGraphRefRelationalExpr (relVarExpr rv))) (M.toList relVars)
       incDepsExprs = map (uncurry AddInclusionDependency) (M.toList incDeps)
       funcsExprs = []
   pure $ MultipleExpr $ relVarsExprs ++ incDepsExprs ++ funcsExprs

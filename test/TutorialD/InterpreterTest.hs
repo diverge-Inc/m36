@@ -234,7 +234,7 @@ assertTutdEqual contextIn transId graph expected tutd = assertEqual (unpack tutd
               Nothing -> Left $ RelVarNotDefinedError "x"
               Just relExpr -> do
                 let env = freshGraphRefRelationalExprEnv (Just context) graph
-                runGraphRefRelationalExprM env (evalGraphRefRelationalExpr relExpr)
+                runGraphRefRelationalExprM env (evalGraphRefRelationalExpr (relVarExpr relExpr))
 
 
 transactionGraphBasicTest :: Test
@@ -276,7 +276,7 @@ transactionRollbackTest = TestCase $ do
   eX <- executeRelationalExpr sessionId dbconn (RelationVariable "x" ())
   
   assertEqual "validate context" (Left (RelVarNotDefinedError "x")) eX
-  let graphEq graphArg = S.map transactionId (transactionsForGraph graphArg)
+  let graphEq graphArg = transactionIdsForGraph graphArg
   assertEqual "validate graph" (graphEq graph) (graphEq graph')
 
 --commit a new transaction with "x" relation, jump to first transaction, verify that "x" is not present
@@ -540,10 +540,10 @@ testEmptyCommits = TestCase $ do
   assertEqual "empty insert empty commit" (Right False) dirty'
   Right () <- commit sessionId dbconn
   
-  --update no tuples- since we defer the restriction, we can only assume the context is dirty, perhaps the constraint checker could offer an optimization here
+  --update no tuples- the relation variable is materialized, so the update is applied right away and found to change nothing
   Right () <- executeDatabaseContextExpr sessionId dbconn (Update "s" (M.singleton "sname" (NakedAtomExpr (TextAtom "Bob"))) (AttributeEqualityPredicate "sname" (NakedAtomExpr (TextAtom "Mike"))))
   dirty'' <- disconnectedTransactionIsDirty sessionId dbconn
-  assertEqual "empty update empty commit" (Right True) dirty''
+  assertEqual "empty update empty commit" (Right False) dirty''
   Right () <- commit sessionId dbconn
 
   --assign the same rel expr
@@ -552,10 +552,10 @@ testEmptyCommits = TestCase $ do
   assertEqual "same relexpr assigned" (Right False) sameREdirty
   Right () <- commit sessionId dbconn
   
-  --delete no tuples
+  --delete no tuples- applied right away to the materialized relation variable and found to change nothing
   Right () <- executeDatabaseContextExpr sessionId dbconn (Delete "s" (AttributeEqualityPredicate "sname" (NakedAtomExpr (TextAtom "Mike"))))
   dirty''' <- disconnectedTransactionIsDirty sessionId dbconn
-  assertEqual "empty delete empty commit" (Right True) dirty'''
+  assertEqual "empty delete empty commit" (Right False) dirty'''
  
 testIntervalAtom :: Test  
 testIntervalAtom = TestCase $ do  

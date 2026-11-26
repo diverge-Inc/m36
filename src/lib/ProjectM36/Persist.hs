@@ -1,6 +1,13 @@
 {-# LANGUAGE ForeignFunctionInterface, CPP, RankNTypes, ScopedTypeVariables #-}
 --this module is related to persisting Project:M36 structures to disk and not related to the persistent library
 module ProjectM36.Persist (writeFileSync, 
+                           writeFileBytesSync,
+                           AppendFile,
+                           openAppendFile,
+                           closeAppendFile,
+                           appendFileSize,
+                           truncateAppendFile,
+                           appendBytesSync,
                            writeSerialiseSync,
                            readDeserialise,
                            renameSync,
@@ -42,6 +49,12 @@ import Foreign.C
 #endif
 
 import System.IO (withFile, IOMode(WriteMode), Handle, withBinaryFile)
+#if defined(mingw32_HOST_OS)
+import System.IO (IOMode(ReadWriteMode), openBinaryFile, hClose, hFileSize, hSetFileSize, hSeek, SeekMode(SeekFromEnd), hFlush)
+#else
+import qualified Data.ByteString.Unsafe as BSU
+import Foreign.Ptr (castPtr, plusPtr)
+#endif
 import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as TE
 
@@ -62,6 +75,75 @@ writeFileSync sync path strOut = withFile path WriteMode handler
     handler handle = do
       BS.hPut handle (TE.encodeUtf8 strOut)
       syncHandle sync handle
+
+writeFileBytesSync :: DiskSync -> FilePath -> BS.ByteString -> IO ()
+writeFileBytesSync sync path bytes = withBinaryFile path WriteMode $ \handle -> do
+  BS.hPut handle bytes
+  syncHandle sync handle
+
+-- | A file which is kept open for appending. Opening a file for every append costs several times as much as the append itself.
+#if defined(mingw32_HOST_OS)
+newtype AppendFile = AppendFile Handle
+
+openAppendFile :: FilePath -> IO AppendFile
+openAppendFile path = AppendFile <$> openBinaryFile path ReadWriteMode
+
+closeAppendFile :: AppendFile -> IO ()
+closeAppendFile (AppendFile handle) = hClose handle
+
+appendFileSize :: AppendFile -> IO Integer
+appendFileSize (AppendFile handle) = hFileSize handle
+
+truncateAppendFile :: AppendFile -> Integer -> IO ()
+truncateAppendFile (AppendFile handle) = hSetFileSize handle
+
+-- | Append the bytes to the file and (depending on the first argument) wait until they have reached the disk.
+appendBytesSync :: DiskSync -> AppendFile -> BS.ByteString -> IO ()
+appendBytesSync sync (AppendFile handle) bytes = do
+  hSeek handle SeekFromEnd 0
+  BS.hPut handle bytes
+  hFlush handle
+  case sync of
+    FsyncDiskSync -> withHandleToHANDLE handle (\h -> Win32.flushFileBuffers h)
+    NoDiskSync -> pure ()
+#else
+newtype AppendFile = AppendFile Posix.Fd
+
+openAppendFile :: FilePath -> IO AppendFile
+openAppendFile path = AppendFile <$>
+#if MIN_VERSION_unix(2,8,0)
+  Posix.openFd path Posix.WriteOnly Posix.defaultFileFlags { Posix.append = True }
+#else
+  Posix.openFd path Posix.WriteOnly Nothing Posix.defaultFileFlags { Posix.append = True }
+#endif
+
+closeAppendFile :: AppendFile -> IO ()
+closeAppendFile (AppendFile fd) = closeFd fd
+
+appendFileSize :: AppendFile -> IO Integer
+appendFileSize (AppendFile fd) = fromIntegral . Posix.fileSize <$> Posix.getFdStatus fd
+
+truncateAppendFile :: AppendFile -> Integer -> IO ()
+truncateAppendFile (AppendFile fd) size = Posix.setFdSize fd (fromIntegral size)
+
+-- | Append the bytes to the file and (depending on the first argument) wait until they have reached the disk.
+appendBytesSync :: DiskSync -> AppendFile -> BS.ByteString -> IO ()
+appendBytesSync sync (AppendFile fd) bytes = do
+  BSU.unsafeUseAsCStringLen bytes $ \(ptr, len) ->
+    let go offset | offset >= len = pure ()
+                  | otherwise = do
+                      written <- Posix.fdWriteBuf fd (castPtr ptr `plusPtr` offset) (fromIntegral (len - offset))
+                      go (offset + fromIntegral written)
+    in go 0
+  case sync of
+    FsyncDiskSync ->
+#if defined(linux_HOST_OS)
+      fileSynchroniseDataOnly fd
+#else
+      fileSynchronise fd
+#endif
+    NoDiskSync -> pure ()
+#endif
 
 --use winery to decode only the data structure and skip the schema
 deserialiseOnly' :: forall s. Serialise s => BS.ByteString -> Either WineryException s

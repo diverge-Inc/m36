@@ -12,8 +12,8 @@ import Data.Functor.Identity
 basicDatabaseContext :: ResolvedDatabaseContext
 basicDatabaseContext = DatabaseContext { inclusionDependencies = Identity mempty,
                                          relationVariables =
-                                           Identity $ M.fromList [("true", ExistingRelation relationTrue),
-                                                                      ("false", ExistingRelation relationFalse)],
+                                           Identity $ M.fromList [("true", relVarFromExpr (ExistingRelation relationTrue)),
+                                                                      ("false", relVarFromExpr (ExistingRelation relationFalse))],
                                          atomFunctions = Identity basicAtomFunctions,
                                          dbcFunctions = Identity basicDatabaseContextFunctions,
                                          notifications = Identity mempty,

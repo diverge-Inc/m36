@@ -44,23 +44,22 @@ someDatabaseContextExprs [s] = s
 someDatabaseContextExprs (s:ss) = MultipleExpr (s:ss)
 someDatabaseContextExprs [] = NoOperation
 
--- | The "fresh" database context is created after a commit, so all values will refer to previous transactions.
-freshDatabaseContext :: TransactionId -> DatabaseContext -> DatabaseContext
-freshDatabaseContext previousTransactionId ctx =
-  DatabaseContext { inclusionDependencies = freshen (inclusionDependencies ctx),
-                    relationVariables = freshen (relationVariables ctx),
-                    atomFunctions = freshen (atomFunctions ctx),
-                    dbcFunctions = freshen (dbcFunctions ctx),
-                    notifications = freshen (notifications ctx),
-                    typeConstructorMapping = freshen (typeConstructorMapping ctx),
-                    registeredQueries = freshen (registeredQueries ctx),
-                    acl = freshen (acl ctx)
+-- | The database context of a workspace on top of the transaction with the id, before anything is changed. The second argument is the context of that transaction: every field of the result refers to the transaction which holds its value.
+unchangedDatabaseContext :: TransactionId -> DatabaseContext -> DatabaseContext
+unchangedDatabaseContext tid ctx =
+  DatabaseContext { inclusionDependencies = unchanged (inclusionDependencies ctx),
+                    relationVariables = unchanged (relationVariables ctx),
+                    atomFunctions = unchanged (atomFunctions ctx),
+                    dbcFunctions = unchanged (dbcFunctions ctx),
+                    notifications = unchanged (notifications ctx),
+                    typeConstructorMapping = unchanged (typeConstructorMapping ctx),
+                    registeredQueries = unchanged (registeredQueries ctx),
+                    acl = unchanged (acl ctx)
                   }
   where
-    freshen :: forall a. ValueMarker a -> ValueMarker a
-    freshen (ValueMarker _) = NotChangedSinceMarker previousTransactionId
-    freshen m@NotChangedSinceMarker{} = m
-                    
+    unchanged :: forall a. ValueMarker a -> ValueMarker a
+    unchanged = unchangedSince tid
+
 toDatabaseContext :: ResolvedDatabaseContext -> DatabaseContext
 toDatabaseContext r =
   DatabaseContext {

@@ -148,13 +148,16 @@ import ProjectM36.Key
 import qualified ProjectM36.DataFrame as DF
 import ProjectM36.DatabaseContextFunction as DCF
 import qualified ProjectM36.IsomorphicSchema as Schema
-import Control.Monad (forever, forM, forM_, unless, void, when)
+import qualified ProjectM36.IsomorphicSchema.Types as SchemaTypes
+import Control.Monad (forever, forM, forM_, unless, when)
 import qualified ProjectM36.RelationalExpression as RE
 import qualified ProjectM36.TransactionGraph as Graph
 import ProjectM36.TransactionGraph as TG
 import qualified ProjectM36.Transaction.Types as Trans
 import ProjectM36.IsomorphicSchema.Types hiding (subschemas, concreteDatabaseContext)
 import ProjectM36.TransactionGraph.Persist
+import ProjectM36.Persist (AppendFile, appendFileSize, closeAppendFile)
+import ProjectM36.Transaction.Persist (objectFilesPath)
 import ProjectM36.Attribute
 import ProjectM36.TransGraphRelationalExpression as TGRE (TransGraphRelationalExpr, process, TransGraphEvalEnv(..))
 import ProjectM36.Persist (DiskSync(..))
@@ -199,7 +202,6 @@ import Data.Time.Clock
 import qualified Network.RPC.Curryer.Client as CRPC
 import qualified Network.RPC.Curryer.Server as SRPC
 import Network.Socket (AddrInfo(..), getAddrInfo, defaultHints, SocketType(..), ServiceName, SockAddr, Family(..), SockAddr(..))
-import GHC.Conc (unsafeIOToSTM)
 import ProjectM36.SQL.Select as SQL
 import ProjectM36.SQL.DBUpdate as SQL
 import ProjectM36.SQL.Convert
@@ -210,7 +212,7 @@ import qualified Data.Set as S
 import qualified ProjectM36.LoginRoles as LoginRoles
 import Streamly.Internal.Network.Socket (SockSpec(..))
 import System.FilePath ((</>))
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 import qualified Network.Socket as Socket
 import qualified Data.HashSet as HS
 import System.Random (StdGen)
@@ -426,19 +428,20 @@ connectPersistentProjectM36 strat sync dbdir freshGraph notificationCallback ghc
   err <- setupDatabaseDir sync dbdir freshGraph 
   case err of
     Left err' -> return $ Left (SetupDatabaseDirectoryError err')
-    Right (lockFileH, digest) -> do
+    Right lockFileH -> do
       mScriptSession <- createScriptSession ghcPkgPaths
-      graph <- transactionGraphLoad dbdir emptyTransactionGraph mScriptSession
+      graph <- transactionGraphLoadFrom dbdir 0 emptyTransactionGraph mScriptSession
       case graph of
         Left err' -> return $ Left (SetupDatabaseDirectoryError err')
-        Right graph' -> do
+        Right (graph', logPosition) -> do
           case TG.validateMerkleHashes graph' of
             Left merkleErrs -> pure (Left (DatabaseValidationError merkleErrs))
             Right _ -> do
               tvarGraph <- newTVarIO graph'
               sessions <- StmMap.newIO
               clientNodes <- StmMap.newIO
-              lockMVar <- newMVar digest
+              lockMVar <- newMVar logPosition
+              logFile <- openTransactionLog dbdir
               notifAsync <- startNotificationListener clientNodes notificationCallback
               maxCacheSize <- RelExprCache.defaultUpperBound
               cache <- RelExprCache.empty maxCacheSize
@@ -449,7 +452,7 @@ connectPersistentProjectM36 strat sync dbdir freshGraph notificationCallback ghc
                           ipSessions = sessions,
                           ipTransactionGraph = tvarGraph,
                           ipScriptSession = mScriptSession,
-                          ipLocks = Just (lockFileH, lockMVar),
+                          ipLocks = Just (lockFileH, lockMVar, logFile),
                           ipCallbackAsync = notifAsync,
                           ipRelExprCache = cache,
                           ipLoginRoles = loginRoles,
@@ -482,7 +485,7 @@ createSessionAtTransactionId_ mHeadName commitId newSessionId (InProcessConnecti
     case RE.transactionForId commitId graph of
         Left err -> pure (Left err)
         Right transaction -> do
-            let freshDiscon = Discon.freshTransaction' currentHead' commitId (Trans.schemas transaction)
+            let freshDiscon = Discon.fromTransaction currentHead' transaction
                 currentHead' = case mHeadName of
                                 Just hname -> Discon.CurrentHeadBranch hname
                                 Nothing -> Discon.CurrentHeadTransactionId commitId
@@ -528,7 +531,7 @@ close (InProcessConnection conf) = do
   let mLocks = ipLocks conf
   case mLocks of
     Nothing -> pure ()
-    Just (lockFileH, _) -> closeLockFile lockFileH
+    Just (lockFileH, _, logFile) -> closeLockFile lockFileH >> closeAppendFile logFile
 
 close (RemoteConnection (RemoteConnectionConf conn)) =
   CRPC.close conn
@@ -703,8 +706,9 @@ executeDatabaseContextExpr sessionId (InProcessConnection conf) expr = do
                           }
                         ctcontext = RE.dbc_context newState
                         newSubschemas = Schema.processDatabaseContextExprSchemasUpdate sschemas expr
+                        -- an unchanged marker is kept as it is: pointing it at the parent transaction instead would build a chain of markers which grows by one link per commit and has to be walked on every use (and it would discard subschemas changed earlier in this uncommitted transaction)
                         newSubschemas' = if newSubschemas == sschemas then
-                                           NotChangedSinceMarker transId
+                                           SchemaTypes.subschemas (Sess.schemas session)
                                          else
                                            ValueMarker newSubschemas
                         newSchemas = Schemas ctcontext newSubschemas' -- the schemas in the disconnectedtransaction need to pass the ctdbc around until commit time
@@ -1009,16 +1013,11 @@ rollback :: SessionId -> Connection -> IO (Either RelationalError ())
 rollback sessionId conn@(InProcessConnection _) = executeAlterTransactionGraphExpr sessionId conn Rollback >> pure (Right ())
 rollback sessionId conn@(RemoteConnection _) = remoteCall conn (ExecuteAlterTransactionGraphExpr sessionId Rollback)
 
--- | Write the transaction graph to disk. This function can be used to incrementally write new transactions to disk.
-processTransactionGraphPersistence :: PersistenceStrategy -> TransactionGraphIncrementalWriteInfo -> IO ()
-processTransactionGraphPersistence NoPersistence _ = pure ()
-processTransactionGraphPersistence (MinimalPersistence dbdir) tWriteInfo = void $ transactionGraphPersistIncremental NoDiskSync dbdir tWriteInfo
-processTransactionGraphPersistence (CrashSafePersistence dbdir) tWriteInfo = void $ transactionGraphPersistIncremental FsyncDiskSync dbdir tWriteInfo
-
-readGraphTransactionIdDigest :: PersistenceStrategy -> IO LockFileHash
-readGraphTransactionIdDigest NoPersistence = error "attempt to read digest from transaction log without persistence enabled"
-readGraphTransactionIdDigest (MinimalPersistence dbdir) = readGraphTransactionIdFileDigest dbdir 
-readGraphTransactionIdDigest (CrashSafePersistence dbdir) = readGraphTransactionIdFileDigest dbdir 
+-- | Append the new transactions and heads to the transaction log on disk. Takes and returns the position in the log up to which this process is in sync with it.
+processTransactionGraphPersistence :: PersistenceStrategy -> AppendFile -> LogPosition -> TransactionGraphIncrementalWriteInfo -> IO LogPosition
+processTransactionGraphPersistence NoPersistence _ position _ = pure position
+processTransactionGraphPersistence MinimalPersistence{} logFile position tWriteInfo = transactionGraphPersistIncremental NoDiskSync logFile position tWriteInfo
+processTransactionGraphPersistence CrashSafePersistence{} logFile position tWriteInfo = transactionGraphPersistIncremental FsyncDiskSync logFile position tWriteInfo
 
 -- | Return a relation whose type would match that of the relational expression if it were executed. This is useful for checking types and validating a relational expression's types. If relvars are mentioned, requires AccessRelVarsPermission. If functions are mentioned, requires ViewFunctionPermission.
 typeForRelationalExpr :: SessionId -> Connection -> RelationalExpr -> IO (Either RelationalError Relation)
@@ -1358,67 +1357,78 @@ commitLock_ sessionId conf stmBlock = do
       graphTvar = ipTransactionGraph conf
       clientNodes = ipClientNodes conf      
       mLockFileH = ipLocks conf
+      dbdir = case strat of
+        MinimalPersistence x -> x
+        CrashSafePersistence x -> x
+        NoPersistence -> error "accessing dbdir on non-persisted connection"
+      -- run the body holding the commit locks; it is handed the position up to which this process has read the transaction log and returns the new one
+      lockHandler :: (Maybe LogPosition -> IO (a, LogPosition)) -> IO a
       lockHandler body = case mLockFileH of
-        Nothing -> body False
-        Just (lockFileH, lockMVar) ->
-          let acquireLocks = do
-                lastWrittenDigest <- takeMVar lockMVar 
-                lockFile lockFileH WriteLock
-                latestDigest <- readGraphTransactionIdDigest strat
-                pure (latestDigest /= lastWrittenDigest)
-              releaseLocks _ = do
-                --still holding the lock- get the latest digest
-                gDigest <- readGraphTransactionIdDigest strat
-                unlockFile lockFileH 
-                putMVar lockMVar gDigest
-          in bracket acquireLocks releaseLocks body
-  manip <- lockHandler $ \dbWrittenByOtherProcess -> atomically $ do
-     eSession <- sessionForSessionId sessionId sessions
-     --handle graph update by other process
-     oldGraph <- readTVar graphTvar
-     case eSession of
-      Left err -> pure (Left err)
-      Right session -> do
-        let dbdir = case strat of
-              MinimalPersistence x -> x
-              CrashSafePersistence x -> x
-              _ -> error "accessing dbdir on non-persisted connection"
-        --this should also happen for non-commit expressions
-        eRefreshedGraph <- if dbWrittenByOtherProcess then
-                             unsafeIOToSTM (transactionGraphLoad dbdir oldGraph mScriptSession)
-                           else
-                             pure (Right oldGraph)
-        case eRefreshedGraph of
-          Left err -> pure (Left (DatabaseLoadError err))
-          Right refreshedGraph -> do
-            eTransWriteInfo <- stmBlock refreshedGraph
-            case eTransWriteInfo of
-              Left err -> pure (Left err)
-              Right (discon, tWriteInfo) -> do
-                writeTVar graphTvar (newGraph tWriteInfo)
-                let newSession = Session discon (Sess.schemaName session)
-                    dbctx = Discon.concreteDatabaseContext discon
-                case RE.resolveDBC' (newGraph tWriteInfo) dbctx DBC.acl of
-                  Left err -> pure (Left err)
-                  Right acl' -> do
-                    let rvacl = relvarsACL acl'
-                    StmMap.insert newSession sessionId sessions
-                    case RE.transactionForId (Sess.parentId session) oldGraph of
-                      Left err -> pure $ Left err
-                      Right previousTrans ->
-                        if not (Prelude.null (uncommittedTransactions tWriteInfo)) then do
-                          (evaldNots, nodes) <- executeCommitExprSTM_ (newGraph tWriteInfo) (Trans.concreteDatabaseContext previousTrans) (Sess.concreteDatabaseContext session) clientNodes
-                          clientNodeMap <- stmMapToList nodes
-                          let nodesToNotify = map snd clientNodeMap
-                          pure $ Right (evaldNots, nodesToNotify, tWriteInfo, rvacl)
-                        else pure (Right (M.empty, [], tWriteInfo, rvacl))
-
-      --handle notification firing                
+        Nothing -> fst <$> body Nothing
+        Just (lockFileH, lockMVar, _) ->
+          modifyMVar lockMVar $ \position ->
+            bracket_ (lockFile lockFileH WriteLock) (unlockFile lockFileH) $ do
+              (res, position') <- body (Just position)
+              pure (position', res)
+  manip <- lockHandler $ \mPosition -> do
+    --handle graph update by other process: if the log has grown past what we have read, apply the new entries first
+    --this should also happen for non-commit expressions
+    eRefreshed <- case mPosition of
+      Nothing -> pure (Right Nothing)
+      Just position -> do
+        logSize <- maybe (pure position) (\(_, _, logFile) -> appendFileSize logFile) mLockFileH
+        if logSize == position then
+          pure (Right Nothing)
+          else do
+          knownGraph <- readTVarIO graphTvar
+          fmap Just <$> transactionGraphLoadFrom dbdir position knownGraph mScriptSession
+    case eRefreshed of
+      Left err -> pure (Left (DatabaseLoadError err), fromMaybe 0 mPosition)
+      Right mRefreshed -> do
+        let position = maybe (fromMaybe 0 mPosition) snd mRefreshed
+        eManip <- atomically $ do
+          eSession <- sessionForSessionId sessionId sessions
+          oldGraph <- readTVar graphTvar
+          case eSession of
+            Left err -> pure (Left err)
+            Right session -> do
+              let refreshedGraph = maybe oldGraph fst mRefreshed
+              eTransWriteInfo <- stmBlock refreshedGraph
+              case eTransWriteInfo of
+                Left err -> pure (Left err)
+                Right (discon, tWriteInfo) -> do
+                  writeTVar graphTvar (newGraph tWriteInfo)
+                  let newSession = Session discon (Sess.schemaName session)
+                      dbctx = Discon.concreteDatabaseContext discon
+                      headIds = fmap Trans.transactionId . transactionHeadsForGraph
+                      -- nothing needs to be written if the operation neither added transactions nor moved a head
+                      needsWrite = not (Prelude.null (uncommittedTransactions tWriteInfo)) || headIds refreshedGraph /= headIds (newGraph tWriteInfo)
+                  case RE.resolveDBC' (newGraph tWriteInfo) dbctx DBC.acl of
+                    Left err -> pure (Left err)
+                    Right acl' -> do
+                      let rvacl = relvarsACL acl'
+                      StmMap.insert newSession sessionId sessions
+                      case RE.transactionForId (Sess.parentId session) oldGraph of
+                        Left err -> pure $ Left err
+                        Right previousTrans ->
+                          if not (Prelude.null (uncommittedTransactions tWriteInfo)) then do
+                            (evaldNots, nodes) <- executeCommitExprSTM_ (newGraph tWriteInfo) (Trans.concreteDatabaseContext previousTrans) (Sess.concreteDatabaseContext session) clientNodes
+                            clientNodeMap <- stmMapToList nodes
+                            let nodesToNotify = map snd clientNodeMap
+                            pure $ Right (evaldNots, nodesToNotify, tWriteInfo, rvacl, needsWrite)
+                          else pure (Right (M.empty, [], tWriteInfo, rvacl, needsWrite))
+        case eManip of
+          Left err -> pure (Left err, position)
+          Right (notsToFire, nodesToNotify, tWriteInfo, acl', needsWrite) -> do
+            --update filesystem database, if necessary, while still holding the lock
+            position' <- case mLockFileH of
+                           Just (_, _, logFile) | needsWrite -> processTransactionGraphPersistence strat logFile position tWriteInfo
+                           _ -> pure position
+            pure (Right (notsToFire, nodesToNotify, acl'), position')
+  --handle notification firing
   case manip of 
     Left err -> pure (Left err)
-    Right (notsToFire, nodesToNotify, tWriteInfo, acl') -> do
-      --update filesystem database, if necessary
-      processTransactionGraphPersistence strat tWriteInfo
+    Right (notsToFire, nodesToNotify, acl') -> do
       sendNotifications conf acl' nodesToNotify notsToFire
       pure (Right ())
 
@@ -1581,7 +1591,7 @@ data InProcessConnectionConf = InProcessConnectionConf {
   ipSessions :: Sessions,
   ipTransactionGraph :: TVar TransactionGraph,
   ipScriptSession :: Maybe ScriptSession,
-  ipLocks :: Maybe (LockFile, MVar LockFileHash), -- nothing when NoPersistence
+  ipLocks :: Maybe (LockFile, MVar LogPosition, AppendFile), -- nothing when NoPersistence; the MVar holds how far this process has read the transaction log, which is kept open for appending
   ipCallbackAsync :: Async (),
   ipRelExprCache :: RelExprCache, -- can the remote client also include such a pinned expr cache? should that cache be controlled by the server or client?
   ipLoginRoles :: LoginRoles.LoginRolesDB, -- ^ roles allowed to connect to the database, access control is otherwise handled by ACLs in the database context

@@ -3,12 +3,13 @@ import ProjectM36.Transaction
 import ProjectM36.Base
 import qualified Data.Text as T
 import qualified Data.Set as S
+import qualified ProjectM36.TransactionGraph.Index as TIdx
 import qualified Data.Map as M
 
 graphAsDot :: TransactionGraph -> String                              
 graphAsDot (TransactionGraph heads transSet) = "digraph {" ++ dot ++ headInfo ++ "}"
   where
-    dot = S.foldr transactionAsDot "" transSet
+    dot = foldr transactionAsDot "" (TIdx.toList transSet)
     transactionAsDot trans acc = acc ++ childArrows trans ++ parentArrows trans
     arrows trans = S.foldr (\c acc' -> acc' ++ oneArrow trans c) ""
     childArrows trans = arrows trans (transactionChildIds trans)

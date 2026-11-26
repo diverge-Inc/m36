@@ -118,7 +118,7 @@ testSubGraphToFirstAncestorBasic = TestCase $ do
   transA <- assertMaybe (transactionForHead "branchA" graph) "failed to get branchA"
   transB <- assertMaybe (transactionForHead "branchB" graph) "failed to get branchB"
   subgraph <- assertEither "testSubGraphToFirstAncestorBasic" $ subGraphOfFirstCommonAncestor graph (transactionHeadsForGraph graph) transA transB S.empty
-  let graphEq graphArg = S.map transactionId (transactionsForGraph graphArg)  
+  let graphEq graphArg = transactionIdsForGraph graphArg  
   assertEqual "no graph changes" (graphEq graph) (graphEq subgraph) 
   
 -- | Test that a branch anchored at the root transaction is removed when using the first ancestor function.
@@ -130,7 +130,7 @@ testSubGraphToFirstAncestorSnipBranch = TestCase $ do
   (_, graph) <- addTransaction "testSubGraphToFirstAncestorSnipBranch" "branchC" (createTrans (fakeUUID [12]) (TI.singleParent (fakeUUID [1]) testTime) (concreteDatabaseContext transA)) baseGraph
   subgraph <- assertEither "testSubGraphToFirstAncestorSnipBranch" $ subGraphOfFirstCommonAncestor graph (transactionHeadsForGraph baseGraph) transA transB S.empty
   assertGraph subgraph
-  let graphEq graphArg = S.map transactionId (transactionsForGraph graphArg)  
+  let graphEq graphArg = transactionIdsForGraph graphArg  
   assertEqual "failed to snip branch" (graphEq baseGraph) (graphEq subgraph)
   
 -- | Test that the subgraph function recurses properly through multiple parent transactions.  
@@ -161,7 +161,7 @@ testSubGraphToFirstAncestorMoreTransactions = TestCase $ do
   subgraph <- assertEither "testSubGraphToFirstAncestorMoreTransactions" $ subGraphOfFirstCommonAncestor graph'' subGraphHeads branchATrans' branchBTrans' S.empty
   --verify that the subgraph includes both the heads and the common ancestor
   let expectedTransSet = S.fromList (map fakeUUID [[1],[3],[4]])
-  assertBool "validate transactions in subgraph" (S.isProperSubsetOf expectedTransSet (S.map transactionId (transactionsForGraph subgraph)))
+  assertBool "validate transactions in subgraph" (S.isProperSubsetOf expectedTransSet (transactionIdsForGraph subgraph))
 
 dudFunctionUtils :: DatabaseContextFunctionUtils
 dudFunctionUtils = DatabaseContextFunctionUtils {
@@ -214,9 +214,9 @@ testUnionPreferMergeStrategy = TestCase $ do
   let branchAContext = (concreteDatabaseContext branchATrans) {
         relationVariables = ValueMarker $ M.insert conflictRelVarName branchARelVar branchARVs
         }
-      branchARelVar = ExistingRelation relationTrue 
+      branchARelVar = relVarFromExpr (ExistingRelation relationTrue)
       branchBContext = (concreteDatabaseContext branchBTrans) {
-            relationVariables = ValueMarker $  M.insert conflictRelVarName (ExistingRelation branchBRelVar) branchBRVs
+            relationVariables = ValueMarker $  M.insert conflictRelVarName (relVarFromExpr (ExistingRelation branchBRelVar)) branchBRVs
             }
       conflictRelVarName = "conflictRelVar" 
 
@@ -232,7 +232,7 @@ testUnionPreferMergeStrategy = TestCase $ do
       mergedRVs <- assertEither "testUnionPreferMergeStrategy" $ resolveDBC' graph'' dbc relationVariables
       let rvExpr = fromMaybe (error "conflictRelVarName") $ M.lookup conflictRelVarName mergedRVs
           reEnv = freshGraphRefRelationalExprEnv (Just dbc) graph
-          eRvRel = runGraphRefRelationalExprM reEnv (evalGraphRefRelationalExpr rvExpr)
+          eRvRel = runGraphRefRelationalExprM reEnv (evalGraphRefRelationalExpr (relVarExpr rvExpr))
       assertEqual "branchB relvar preferred in conflict" (Right branchBRelVar) eRvRel
   
 -- try various individual component conflicts and check for merge failure
@@ -248,14 +248,14 @@ testUnionMergeStrategyOnRelVars = TestCase $ do
   let updatedBranchBContext = (concreteDatabaseContext branchBTrans) {
         relationVariables = ValueMarker $ M.insert branchBOnlyRelVarName branchBOnlyRelVar branchBRVs
         }
-      branchBOnlyRelVar = ExistingRelation relationTrue
+      branchBOnlyRelVar = relVarFromExpr (ExistingRelation relationTrue)
       branchBOnlyRelVarName = "branchBOnlyRelVar"
   (_, graph') <- addTransaction "testUnionMergeStrategy" "branchB" (createTrans (fakeUUID [3]) (TI.singleParent (transactionId branchBTrans) testTime) updatedBranchBContext) graph
   let env = freshGraphRefRelationalExprEnv Nothing graph'
   (UncommittedTransaction trans, graph'') <- assertEither "testUnionMergeStrategy" $ runGraphRefRelationalExprM env $ mergeTransactions testTime (fakeUUID [5]) (fakeUUID [10]) UnionMergeStrategy (MergeHeadNames {sourceHead = "branchA", targetHead = "branchB" })
   branchBRVs' <- assertEither "testUnionMergeStrategy3" $ resolveDBC' graph'' (concreteDatabaseContext trans) relationVariables
   let rvExpr = fromMaybe (error "branchOnlyBRelVarName") $ M.lookup branchBOnlyRelVarName branchBRVs'
-      rvRel = fromRight (error "rvRel") $ runGraphRefRelationalExprM reEnv (evalGraphRefRelationalExpr rvExpr)
+      rvRel = fromRight (error "rvRel") $ runGraphRefRelationalExprM reEnv (evalGraphRefRelationalExpr (relVarExpr rvExpr))
       reEnv = freshGraphRefRelationalExprEnv (Just (concreteDatabaseContext trans)) graph'
       
   assertEqual "branchBOnlyRelVar should appear in the merge" relationTrue rvRel
@@ -353,8 +353,8 @@ testUnionMergeIncDepViolation = TestCase $ do
       rvName = "x"
       branchArv = fromRight (error "branchArv") $ eRel 2
       branchBrv = fromRight (error "branchBrv") $ eRel 3
-      branchAContext = (concreteDatabaseContext branchBTrans) {relationVariables = ValueMarker $ M.singleton rvName (ExistingRelation branchArv)}
-      branchBContext = (concreteDatabaseContext branchBTrans) { relationVariables = ValueMarker $ M.singleton rvName (ExistingRelation branchBrv), 
+      branchAContext = (concreteDatabaseContext branchBTrans) {relationVariables = ValueMarker $ M.singleton rvName (relVarFromExpr (ExistingRelation branchArv))}
+      branchBContext = (concreteDatabaseContext branchBTrans) { relationVariables = ValueMarker $ M.singleton rvName (relVarFromExpr (ExistingRelation branchBrv)), 
                                                                 inclusionDependencies = ValueMarker $ M.singleton incDepName incDep}      
       incDepName = "x_key"
       incDep = inclusionDependencyForKey (AttributeNames (S.singleton "x")) (RelationVariable "x" ())

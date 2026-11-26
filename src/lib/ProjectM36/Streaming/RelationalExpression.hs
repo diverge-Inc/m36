@@ -10,7 +10,7 @@ import ProjectM36.TransactionGraph
 import ProjectM36.PinnedRelationalExpr
 import ProjectM36.Cache.RelationalExprCache as RECache
 import ProjectM36.DatabaseContext.Types
-import ProjectM36.Relation (RestrictionFilter, ContextTuples, attributes, contextTupleAtomForAttributeName, tupleSet)
+import ProjectM36.Relation (RestrictionFilter, ContextTuples, attributes, contextTupleAtomForAttributeName, tupleSet, restrictionCandidates)
 import ProjectM36.WithNameExpr
 import Streamly.Data.Stream (Stream)
 import qualified Streamly.Data.Stream as Stream
@@ -187,7 +187,7 @@ planGraphRefRelationalExpr (RelationVariable name tid) gfEnv = do
   rvMap <- resolveDBC' graph ctx relationVariables
   case M.lookup name rvMap of
     Nothing -> Left (RelVarNotDefinedError name)
-    Just rvExpr -> planGraphRefRelationalExpr rvExpr gfEnv
+    Just rv -> planGraphRefRelationalExpr (relVarExpr rv) gfEnv
 planGraphRefRelationalExpr orig@(RelationValuedAttribute relAttrName) gfEnv = do
   case A.attributeForName relAttrName (envAttributes gfEnv) of
     Left err -> throw err
@@ -336,9 +336,14 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
             --potential optimization- lookup attrs in advance to rename the correct vector index
             pure (Right (streamRelationMap newAttrs (pure . tupleRenameAttributes attrsAssoc) relS))
             
-    RestrictTupleStreamPlan restrictionFilter _predExpr expr () _origExpr ->
+    RestrictTupleStreamPlan restrictionFilter predExpr expr () _origExpr ->
       checkCacheOr $ do
-        eStream <- executePlan expr ctxTuples gfEnv cacheKeyBlackList cache
+        eStream <- case expr of
+          -- if it is known that only some of the tuples can satisfy the predicate, start from those instead of from all tuples (the complete predicate is still applied below)
+          ExistingRelationPlan rel@(Relation attrs _) ()
+            | Just candidates <- restrictionCandidates predExpr rel ->
+                pure (Right (StreamRelation attrs (Stream.fromList candidates)))
+          _ -> executePlan expr ctxTuples gfEnv cacheKeyBlackList cache
         case eStream of
           Left err -> pure (Left err)
           Right (StreamRelation attrs tupS) -> do

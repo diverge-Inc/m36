@@ -29,7 +29,7 @@ typesForRelationVariables ctx tgraph = do
   rvs <- resolveDBC' tgraph ctx relationVariables
   let gfEnv = freshGraphRefRelationalExprEnv (Just ctx) tgraph
   M.fromList <$> mapM (\(rvname, rvexpr) -> do
-           rvtype <- runGraphRefRelationalExprM gfEnv (typeForGraphRefRelationalExpr rvexpr)
+           rvtype <- runGraphRefRelationalExprM gfEnv (typeForGraphRefRelationalExpr (relVarExpr rvexpr))
            pure (rvname, rvtype)
                       ) (M.toList rvs)
 
