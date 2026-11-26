@@ -28,7 +28,8 @@ data Opts = Opts { datadir :: FilePath,
                    useFsync :: Bool,
                    useKey :: Bool,
                    lookups :: Int,
-                   mutations :: Int
+                   mutations :: Int,
+                   reorder :: Bool
                  }
 
 parseOptions :: Parser Opts
@@ -41,22 +42,32 @@ parseOptions = Opts <$>
   switch (long "fsync" <> help "use CrashSafePersistence (fsync) instead of MinimalPersistence") <*>
   switch (long "key" <> help "add a uniqueness constraint on id when the relvar is created") <*>
   option auto (long "lookups" <> value 1000 <> help "number of point lookups in read mode") <*>
-  option auto (long "mutations" <> value 0 <> help "in read mode, also update and then delete this many events by id, one commit each")
+  option auto (long "mutations" <> value 0 <> help "in read mode, also update and then delete this many events by id, one commit each") <*>
+  switch (long "reorder" <> help "insert tuples whose attributes are listed in the reverse order of the relation variable's")
 
 eventAttrs :: Attributes
 eventAttrs = A.attributesFromList [Attribute "id" IntegerAtomType,
                                    Attribute "kind" TextAtomType,
                                    Attribute "payload" TextAtomType]
 
-eventTuple :: Int -> RelationTuple
-eventTuple i = RelationTuple eventAttrs (V.fromList [IntegerAtom (fromIntegral i),
-                                                    TextAtom (kinds !! (i `mod` length kinds)),
-                                                    TextAtom (T.replicate 4 "0123456789abcdefghijklmno" <> T.pack (show i))])
+eventAtoms :: Int -> [Atom]
+eventAtoms i = [IntegerAtom (fromIntegral i),
+                TextAtom (kinds !! (i `mod` length kinds)),
+                TextAtom (T.replicate 4 "0123456789abcdefghijklmno" <> T.pack (show i))]
   where
     kinds = ["created", "renamed", "moved", "archived"]
 
-insertEvent :: Int -> DatabaseContextExpr
-insertEvent i = Insert "event" (MakeStaticRelation eventAttrs (TupleList [eventTuple i]))
+eventTuple :: Int -> RelationTuple
+eventTuple i = RelationTuple eventAttrs (V.fromList (eventAtoms i))
+
+-- | The same attributes in the reverse order.
+reversedEventAttrs :: Attributes
+reversedEventAttrs = A.attributesFromList (reverse (A.toList eventAttrs))
+
+-- | Insert one event. With the flag, the inserted relation lists its attributes in the reverse order of the relation variable's.
+insertEvent :: Bool -> Int -> DatabaseContextExpr
+insertEvent False i = Insert "event" (MakeStaticRelation eventAttrs (TupleList [eventTuple i]))
+insertEvent True i = Insert "event" (MakeStaticRelation reversedEventAttrs (TupleList [RelationTuple reversedEventAttrs (V.fromList (reverse (eventAtoms i)))]))
 
 eCheck :: Show e => IO (Either e a) -> IO a
 eCheck v = do
@@ -96,7 +107,7 @@ main = do
           batches = chunk (batchSize opts) ids
       (totalSecs, ()) <- timed $ forM_ batches $ \batch -> do
         (secs, parts) <- timed $ forM batch $ \i -> do
-          (execSecs, ()) <- timed $ eCheck $ executeDatabaseContextExpr sessionId conn (insertEvent i)
+          (execSecs, ()) <- timed $ eCheck $ executeDatabaseContextExpr sessionId conn (insertEvent (reorder opts) i)
           (commitSecs, ()) <- timed $ eCheck $ commit sessionId conn
           pure (execSecs, commitSecs)
         let perCommit t = t * 1000 / fromIntegral (length batch)

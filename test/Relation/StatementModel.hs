@@ -4,15 +4,17 @@
 -- None of that may change what a statement means. This test runs a long pseudo-random (but fixed) sequence of statements against a database on disk and against a model which knows nothing of those layers: a plain set of rows, the textbook meaning of insert, update and delete, and constraints which are checked by looking at all rows. Database and model have to agree after every statement on the tuples and on whether the statement is rejected, and the database has to come back from disk in the state of the model.
 import Test.HUnit
 import ProjectM36.Client
-import ProjectM36.Base (Attributes, Relation)
+import ProjectM36.Base (Attributes(..), Relation(..), RelationTupleSet(StoredTuples), relVarExpr)
 import ProjectM36.Relation (mkRelationFromList)
+import qualified ProjectM36.Relation as R (union)
+import qualified ProjectM36.RelVarValue as RV
 import ProjectM36.Attribute (attributesFromList)
 import qualified Data.Map as M
 import qualified Data.Set as S
 import qualified Data.Text as T
 import Data.Text (Text)
 import Data.Either (isLeft, isRight)
-import Control.Monad (foldM, when)
+import Control.Monad (foldM, forM_, when)
 import System.Exit
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -20,7 +22,7 @@ import System.Random (StdGen, mkStdGen, randomR, initStdGen)
 
 main :: IO ()
 main = do
-  tcounts <- runTestTT (TestList [testStatementsAgreeWithModel])
+  tcounts <- runTestTT (TestList [testStatementsAgreeWithModel, testUnionKeepsHeldTuples])
   if errors tcounts + failures tcounts > 0 then exitFailure else exitSuccess
 
 -- | A row of the relation variable @t {id Integer, grp Integer, val Text}@.
@@ -195,3 +197,24 @@ testStatementsAgreeWithModel = TestCase $
     assertEqual "merkle hashes after reopening" (Right ()) hashes
     when (S.null (groups final)) (assertFailure "no groups left")
     close conn'
+
+-- | An insert is the union of the inserted relation and the relation variable, in that order, and the inserted relation may list its attributes in any order. The insert stays cheap because a union with a relation which holds its tuples adds to what is held, whichever operand that relation is, and keeps its order of attributes. (The order of attributes means nothing in the relational model; if the union took the order of the inserted relation instead, every such insert would rebuild the relation variable.)
+testUnionKeepsHeldTuples :: Test
+testUnionKeepsHeldTuples = TestCase $ do
+  let attrs = attributesFromList [Attribute "id" IntegerAtomType, Attribute "val" TextAtomType]
+      reversed = attributesFromList [Attribute "val" TextAtomType, Attribute "id" IntegerAtomType]
+      must :: Show e => Either e a -> IO a
+      must = either (assertFailure . show) pure
+  base <- must (mkRelationFromList attrs [[IntegerAtom 1, TextAtom "a"], [IntegerAtom 2, TextAtom "b"]])
+  new <- must (mkRelationFromList reversed [[TextAtom "c", IntegerAtom 3]])
+  expected <- must (mkRelationFromList attrs [[IntegerAtom 1, TextAtom "a"], [IntegerAtom 2, TextAtom "b"], [IntegerAtom 3, TextAtom "c"]])
+  held <- case relVarExpr <$> RV.holding base of
+            Just (ExistingRelation rel) -> pure rel
+            _ -> assertFailure "the relation cannot be held"
+  forM_ [("held relation first", R.union held new), ("held relation second", R.union new held)] $ \(name, result) ->
+    case result of
+      Right rel@(Relation resultAttrs (StoredTuples _)) -> do
+        assertEqual (name <> ": tuples") expected rel
+        assertEqual (name <> ": order of attributes") (attributesVec attrs) (attributesVec resultAttrs)
+      Right _ -> assertFailure (name <> ": the tuples of the union are not held any more")
+      Left err -> assertFailure (name <> ": " <> show err)

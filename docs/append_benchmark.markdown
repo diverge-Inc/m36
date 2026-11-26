@@ -32,6 +32,8 @@ scripts/bench-append-postgres.sh 20000
 
 `scripts/bench-append-postgres.sh` creates a throwaway PostgreSQL cluster (it needs `initdb`, `pg_ctl`, `psql` and `pgbench` on `PATH`).
 
+With `--reorder`, the appended tuples list their attributes in the reverse order of the relation variable's.
+
 ## Results
 
 Apple M-series laptop, macOS, GHC 9.10.3, PostgreSQL 17.11, 20,000 events. Times are per operation.
@@ -77,6 +79,8 @@ The relational logic does not know how any of this is made fast. `insert`, `upda
 | the change between two versions of the relation variables | `ProjectM36.RelationVariablesDelta` | one function, used to define the Merkle hash |
 | storage: the transaction log | `ProjectM36.TransactionGraph.Persist`, `ProjectM36.Transaction.Persist`, `ProjectM36.Persist` | nothing; only `ProjectM36.Client` calls it, to load the log and to append to it |
 | finding transactions and unchanged parts | `ProjectM36.TransactionGraph.Index`, `ProjectM36.ValueMarker` | lookup by id; markers it can read but not forge |
+
+One consequence is visible outside: the union of a relation with one whose tuples are held has the order of attributes of the latter, whichever operand it is, where upstream takes the order of the first operand. The order of attributes means nothing in the relational model ("the relation header is a set of attributes, so the attributes also have no ordering", [introduction to the relational algebra](introduction_to_the_relational_algebra.markdown)), and equality of attributes, tuples and relations ignores it. It matters here because `insert` is the union of the inserted relation and the relation variable, in that order, and the tuples are held in the order of the relation variable. If the union took the order of the inserted relation, an insert which lists its attributes in another order would rebuild the relation variable: measured with `--reorder`, an append then takes 2.4 ms at 2,000 events and 25.5 ms at 8,000 instead of 0.14 ms throughout. The alternative, keeping upstream's union and writing `insert` with the relation variable first, is just as fast but leaves a line in the relational logic whose only reason is speed.
 
 Two things check that the layers change how fast a statement is and not what it means. `test-statement-model` runs 600 pseudo-random statements (inserts, updates and deletes which hit existing keys and missing foreign keys, commits, rollbacks) against a database on disk and against a model which is a plain set of rows with constraints checked by looking at every row; both have to agree after every statement, and the database has to come back from disk in the state of the model. And with the five functions of `ProjectM36.OptimizationHooks` replaced by their trivial implementations, the same test still passes.
 
