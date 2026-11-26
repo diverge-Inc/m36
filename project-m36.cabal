@@ -233,6 +233,8 @@ Library
                      ProjectM36.Streaming.RelationalExpression,
                      ProjectM36.Streaming.Compat,
                      ProjectM36.TupleStore,
+                     ProjectM36.RelVarValue,
+                     ProjectM36.OptimizationHooks,
                      ProjectM36.PointerEquality,
                      ProjectM36.RelationVariablesDelta,     
                      ProjectM36.Cache.RelationalExprCache,
@@ -620,6 +622,11 @@ Test-Suite test-transactiongraph-persist
     import: commontest
     type: exitcode-stdio-1.0
     main-is: TransactionGraph/Persist.hs
+
+Test-Suite test-statement-model
+    import: commontest
+    type: exitcode-stdio-1.0
+    main-is: Relation/StatementModel.hs
 
 Test-Suite test-relation-import-csv
     import: commontest

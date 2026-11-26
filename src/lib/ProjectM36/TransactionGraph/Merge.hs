@@ -6,7 +6,7 @@ import ProjectM36.Error
 import ProjectM36.ValueMarker
 import ProjectM36.TransactionGraph.Types
 import ProjectM36.RelationalExpression
-import qualified ProjectM36.TupleStore as TStore
+import qualified ProjectM36.RelVarValue as RV
 import ProjectM36.DatabaseContext.Types
 import ProjectM36.AccessControlList
 import ProjectM36.DatabaseContext.Fields
@@ -51,7 +51,7 @@ unionMergeMaps field prefer graph f v_mapA v_mapB = do
 -- perform the merge even if the attributes are different- is this what we want? Obviously, we need finer-grained merge options.
 unionMergeRelation :: MergePreference -> RelVarValue -> RelVarValue -> GraphRefRelationalExprM RelVarValue
 -- both branches hold the same tuples (typically because neither changed the relation variable): there is nothing to merge, and the value stays shared with the branches
-unionMergeRelation _prefer rvA@(StoredRelVar storeA) (StoredRelVar storeB) | storeA == storeB = pure rvA
+unionMergeRelation _prefer rvA rvB | RV.sameTuples rvA rvB = pure rvA
 unionMergeRelation prefer rvA rvB = do
   let unioned = Union (relVarExpr rvA) (relVarExpr rvB)
       mergeErr e = MergeTransactionError (StrategyViolatesRelationVariableMergeError e)
@@ -63,9 +63,9 @@ unionMergeRelation prefer rvA rvB = do
       handler AttributeNamesMismatchError{} = preferredRelVar
       handler err' = throwError (mergeErr err')
       -- two relation variables which hold their tuples merge into one which holds the union; otherwise the merged relation variable is defined by the union of the expressions
-      merged rel = case (rvA, rvB) of
-        (StoredRelVar storeA, StoredRelVar{}) | Just store <- TStore.storeFromRelationLike storeA rel -> StoredRelVar store
-        _ -> DerivedRelVar unioned
+      merged rel
+        | RV.holdsTuples rvA && RV.holdsTuples rvB, Just held <- RV.holdingLike rvA rel = held
+        | otherwise = DerivedRelVar unioned
   --typecheck first?
   (merged <$> evalGraphRefRelationalExpr unioned) `catchError` handler
 

@@ -7,6 +7,7 @@
 module ProjectM36.TupleStore where
 import ProjectM36.Base
 import ProjectM36.PointerEquality
+import qualified ProjectM36.Attribute as A
 import qualified Data.HashSet as HS
 import qualified Data.HashMap.Strict as HM
 import qualified Data.HashMap.Internal as HMI
@@ -57,11 +58,24 @@ storeFromRelation :: Relation -> Maybe TupleStore
 storeFromRelation (Relation _ (StoredTuples store)) = Just store
 storeFromRelation (Relation attrs (TupleList tups)) = storeFromTuples attrs tups
 
--- | Like 'storeFromRelation' but with the indexes of an earlier value of the same relation variable.
+-- | The body of the relation as a store which holds it the way an earlier value of the same relation variable was held: with the same order of attributes (if the attributes are still the same) and the same indexes. Constant time if the body is a store which was derived from the earlier one.
 storeFromRelationLike :: TupleStore -> Relation -> Maybe TupleStore
-storeFromRelationLike previous rel = do
-  store <- storeFromRelation rel
-  pure (foldl' (flip storeEnsureIndex) store (indexedAttributeNames (storeIndexes previous)))
+storeFromRelationLike previous rel@(Relation attrs tupSet) =
+  case tupSet of
+    StoredTuples store | attributesVec (storeAttributes store) == attributesVec (storeAttributes previous) -> Just (withIndexes store)
+    _ | A.attributesEqual attrs (storeAttributes previous) -> storeInsertTupleSet (storeEmptyLike previous) tupSet
+      | otherwise -> withIndexes <$> storeFromRelation rel
+  where
+    withIndexes store = foldl' (flip storeEnsureIndex) store (indexedAttributeNames (storeIndexes previous))
+
+-- | Whether two stores hold the same tuples. When one store was derived from the other, this takes time proportional to their difference.
+storeSameTuples :: TupleStore -> TupleStore -> Bool
+storeSameTuples a b
+  | attributesVec (storeAttributes a) == attributesVec (storeAttributes b) =
+      storeSize a == storeSize b && case storeDiff (storeTuples a) (storeTuples b) of
+                                      ([], []) -> True
+                                      _ -> False
+  | otherwise = a == b
 
 -- | Insert atom vectors (in the attribute order of the store). Tuples already present are skipped.
 storeInsertVectors :: TupleStore -> [AtomVector] -> TupleStore
@@ -214,12 +228,6 @@ storeLookupByEqualities equalities store =
     names : _ -> storeIndexLookup names (V.fromList (map (equalities M.!) (S.toAscList names))) store
   where
     usable names = if not (S.null names) && all (`M.member` equalities) names then Just names else Nothing
-
--- | The attribute = constant terms which every tuple satisfying the predicate must satisfy.
-predicateEqualities :: RestrictionPredicateExprBase a -> M.Map AttributeName Atom
-predicateEqualities (AndPredicate exprA exprB) = M.union (predicateEqualities exprA) (predicateEqualities exprB)
-predicateEqualities (AttributeEqualityPredicate attrName (NakedAtomExpr atom)) = M.singleton attrName atom
-predicateEqualities _ = M.empty
 
 -- | Whether the attribute names are a key of the tuples: Just True/False if the store has an index on them, Nothing if it cannot tell cheaply.
 storeIsUnique :: S.Set AttributeName -> TupleStore -> Maybe Bool

@@ -229,9 +229,15 @@ instance Read Relation where
 
 instance Eq RelationTupleSet where
  StoredTuples store1 == StoredTuples store2 = store1 == store2
+ -- a list with fewer tuples than a store cannot be equal to it; this is decided without walking the store
+ TupleList tups == StoredTuples store | tups `shorterThan` storeSize store = False
+ StoredTuples store == TupleList tups | tups `shorterThan` storeSize store = False
  set1 == set2 = hset set1 == hset set2
    where
      hset = HS.fromList . asList
+
+shorterThan :: [a] -> Int -> Bool
+shorterThan xs n = n > 0 && null (drop (n - 1) xs)
 
 instance NFData RelationTupleSet where
   rnf (TupleList tups) = rnf tups

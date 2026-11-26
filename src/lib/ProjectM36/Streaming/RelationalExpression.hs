@@ -10,9 +10,8 @@ import ProjectM36.TransactionGraph
 import ProjectM36.PinnedRelationalExpr
 import ProjectM36.Cache.RelationalExprCache as RECache
 import ProjectM36.DatabaseContext.Types
-import ProjectM36.Relation (RestrictionFilter, ContextTuples, attributes, contextTupleAtomForAttributeName, tupleSet)
+import ProjectM36.Relation (RestrictionFilter, ContextTuples, attributes, contextTupleAtomForAttributeName, tupleSet, restrictionCandidates)
 import ProjectM36.WithNameExpr
-import qualified ProjectM36.TupleStore as TStore
 import Streamly.Data.Stream (Stream)
 import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.Data.Stream.Prelude as Stream
@@ -340,9 +339,9 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
     RestrictTupleStreamPlan restrictionFilter predExpr expr () _origExpr ->
       checkCacheOr $ do
         eStream <- case expr of
-          -- equality on indexed attributes of a materialized relation: start from the tuples found through the index instead of from all tuples (the complete predicate is still applied below)
-          ExistingRelationPlan (Relation attrs (StoredTuples store)) ()
-            | Just candidates <- TStore.storeLookupByEqualities (TStore.predicateEqualities predExpr) store ->
+          -- if it is known that only some of the tuples can satisfy the predicate, start from those instead of from all tuples (the complete predicate is still applied below)
+          ExistingRelationPlan rel@(Relation attrs _) ()
+            | Just candidates <- restrictionCandidates predExpr rel ->
                 pure (Right (StreamRelation attrs (Stream.fromList candidates)))
           _ -> executePlan expr ctxTuples gfEnv cacheKeyBlackList cache
         case eStream of

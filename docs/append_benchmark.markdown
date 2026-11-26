@@ -38,10 +38,10 @@ Apple M-series laptop, macOS, GHC 9.10.3, PostgreSQL 17.11, 20,000 events. Times
 
 | operation | before this work | Project:M36 | PostgreSQL |
 | --- | --- | --- | --- |
-| append and commit | 8.5 ms at 250 events, 26.6 ms at 1,000 events, growing linearly | 0.13 ms | 0.053 ms |
-| update by id and commit | - | 0.12 ms | 0.048 ms |
-| delete by id and commit | - | 0.08 ms | 0.045 ms |
-| open | 3.3 s at 1,000 events | 0.27 s | 0.16 s |
+| append and commit | 8.5 ms at 250 events, 26.6 ms at 1,000 events, growing linearly | 0.13 - 0.15 ms | 0.053 ms |
+| update by id and commit | - | 0.11 - 0.13 ms | 0.048 ms |
+| delete by id and commit | - | 0.08 - 0.10 ms | 0.045 ms |
+| open | 3.3 s at 1,000 events | 0.26 - 0.29 s | 0.16 s |
 | scan (20,000 tuples) | 468 ms at 1,000 events (first read) | 1.4 - 2.4 ms | 3.6 ms |
 | lookup by id | 2.5 ms at 1,000 events | 0.025 ms | 0.034 ms |
 | filter by kind (5,000 tuples) | 2.4 ms at 1,000 events | 3.2 - 4.4 ms | 1.5 ms |
@@ -53,6 +53,33 @@ With 100,000 events, an append still takes 0.13 - 0.15 ms per commit and a looku
 
 The times vary by about a tenth from run to run on this machine.
 
+How the costs grow with the number of events (each event is one commit):
+
+| events | append and commit | transaction log | open |
+| --- | --- | --- | --- |
+| 1,000 | 0.13 - 0.17 ms | 380 kB (380 bytes per commit) | 0.03 s |
+| 2,000 | 0.14 - 0.15 ms | 760 kB (380 bytes per commit) | 0.04 s |
+| 4,000 | 0.14 - 0.15 ms | 1.5 MB (380 bytes per commit) | 0.07 s |
+| 8,000 | 0.14 - 0.15 ms | 3.0 MB (380 bytes per commit) | 0.11 s |
+
+A commit costs the same whatever came before it, the log grows by the same number of bytes with every commit, and opening (which reads the log once and validates the Merkle hash of every transaction) takes about 13 microseconds per transaction.
+
+## How the optimizations are layered
+
+The relational logic does not know how any of this is made fast. `insert`, `update` and `delete` are still defined in `ProjectM36.RelationalExpression` the way upstream defines them, as the assignment of an expression over the current value (`new union x`, `x where not p`, and the union of the untouched and the updated part); the only addition is that the expression is evaluated right away. That module imports neither the store nor the indexes. What makes the statements cheap sits below and beside it:
+
+| layer | modules | what the logic sees of it |
+| --- | --- | --- |
+| how tuples are held: a persistent hash set with indexes | `ProjectM36.TupleStore`, `ProjectM36.PointerEquality` | nothing |
+| relational operators which keep held tuples shared: a union with, or a restriction of, a relation whose tuples are held adds to or removes from its store, and a restriction on indexed attributes looks at the tuples the index finds | `union`, `restrictByPredicate` in `ProjectM36.Relation`, `tupleSetUnion` in `ProjectM36.TupleSet` | the operators it has always called; a restriction passes its predicate along with its filter |
+| the value of a relation variable | `ProjectM36.RelVarValue` | whether a relation variable holds its tuples, and how to make one hold the tuples of a relation |
+| shortcuts: indexes for declared keys, keys decided by an index, constraints which a change cannot affect | `ProjectM36.OptimizationHooks` | five functions, each with a trivial implementation (`id`, `Nothing`, "all of them") which is always correct |
+| the change between two versions of the relation variables | `ProjectM36.RelationVariablesDelta` | one function, used to define the Merkle hash |
+| storage: the transaction log | `ProjectM36.TransactionGraph.Persist`, `ProjectM36.Transaction.Persist`, `ProjectM36.Persist` | nothing; only `ProjectM36.Client` calls it, to load the log and to append to it |
+| finding transactions and unchanged parts | `ProjectM36.TransactionGraph.Index`, `ProjectM36.ValueMarker` | lookup by id; markers it can read but not forge |
+
+Two things check that the layers change how fast a statement is and not what it means. `test-statement-model` runs 600 pseudo-random statements (inserts, updates and deletes which hit existing keys and missing foreign keys, commits, rollbacks) against a database on disk and against a model which is a plain set of rows with constraints checked by looking at every row; both have to agree after every statement, and the database has to come back from disk in the state of the model. And with the five functions of `ProjectM36.OptimizationHooks` replaced by their trivial implementations, the same test still passes.
+
 ## What keeps it that way
 
 Each of the slowdowns removed by this work came from something which the types allowed and only a convention forbade. The conventions are now types, so that a later change cannot bring the slowdown back without the compiler objecting.
@@ -61,7 +88,7 @@ Each of the slowdowns removed by this work came from something which the types a
 | --- | --- |
 | A transaction is found by its id without scanning the graph. | `TransactionGraph` holds a `TransactionIndex` (`ProjectM36.TransactionGraph.Index`), whose only way to find a transaction is the lookup by id. Listing all transactions is a separate, explicitly linear function. |
 | The value of an unchanged part of a transaction is one lookup away, however long the history. | A reference to an earlier transaction (`NotChangedSinceMarker`) can be matched on but not applied. The only way to make one is `unchangedSince`, which takes the marker of the transaction referred to and passes an existing reference on as it is. A reference therefore always names the transaction which holds the value; references cannot form a chain. Sessions get their workspace from `DisconnectedTransaction.fromTransaction`, and a log whose references do not name holders is refused when it is read. |
-| Inserting, updating or deleting tuples costs time proportional to those tuples, and never makes later reads or writes more expensive. | A relation variable is a `RelVarValue`: `StoredRelVar` holds a `TupleStore`, `DerivedRelVar` holds an expression. The statements work on the store with functions of type store -> tuples -> store (`ProjectM36.TupleStore`), which cannot express "the old value and something more" other than as the new set of tuples. A relation variable is only defined by an expression where the code says `DerivedRelVar`: an assignment of a non-constant expression, or a merge. |
+| Inserting, updating or deleting tuples costs time proportional to those tuples, and never makes later reads or writes more expensive. | A relation variable is a `RelVarValue`: `StoredRelVar` holds a `TupleStore`, `DerivedRelVar` holds an expression. A statement on a relation variable which holds its tuples evaluates its expression right away and holds the result (`changeTuples`); it has no way to leave the expression behind. The store is only changed by functions of type store -> tuples -> store (`ProjectM36.TupleStore`). A relation variable is only defined by an expression where the code says `DerivedRelVar`: an assignment of a non-constant expression, or a merge. |
 | Two versions of a relation variable are compared in time proportional to their difference. | The comparison skips shared parts by pointer equality, which is only meaningful for evaluated values. `ptrEquals` takes `Forced` arguments, an unlifted type with a strict field: it cannot be handed an unevaluated value. |
 | The work of a statement is done by that statement, not left for a later one. | The fields of `TupleStore`, `TupleStoreIndex` and `RelVarValue` are strict, and the indexes of a store are a strict list (`TupleStoreIndexes`). An index is therefore updated when a tuple changes. (With a lazy map the updates piled up unevaluated, one per tuple, and the first statement to use the index paid for all of them: opening looked faster and the first lookups slower than they were.) |
 | A commit writes and hashes what it changed. | `transactionToRecord` and `hashTransaction` are given the relation variables of the parent and turn them into a `RelVarsDelta` before anything is written or hashed. |

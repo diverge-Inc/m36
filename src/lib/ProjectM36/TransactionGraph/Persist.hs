@@ -5,6 +5,7 @@ import ProjectM36.Transaction.Persist
 import ProjectM36.TransactionGraph
 import ProjectM36.TransactionGraph.Types
 import qualified ProjectM36.TransactionGraph.Index as TIdx
+import qualified ProjectM36.OptimizationHooks as Hooks
 import ProjectM36.Transaction.Types
 import ProjectM36.RelationalExpression
 import ProjectM36.Base
@@ -233,4 +234,4 @@ withKeyIndexes graph trans@(Transaction tid tinfo (Schemas context sschemas)) =
     ValueMarker relVars ->
       case resolveDBC' graph context inclusionDependencies of
         Left _ -> trans
-        Right incDeps -> Transaction tid tinfo (Schemas context { relationVariables = ValueMarker (ensureAllKeyIndexes incDeps relVars) } sschemas)
+        Right incDeps -> Transaction tid tinfo (Schemas context { relationVariables = ValueMarker (Hooks.prepareRelVars incDeps relVars) } sschemas)
