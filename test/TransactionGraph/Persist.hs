@@ -25,9 +25,12 @@ import Data.Time.Clock
 import Data.Time.Calendar
 import ProjectM36.Client as C
 import ProjectM36.Relation
-import ProjectM36.Transaction.Persist
 import ProjectM36.DatabaseContext.Types hiding (DatabaseContextFunctionUtils(..))
 import Control.Monad (forM)
+import qualified Data.Vector as V
+import qualified Data.ByteString as BS
+import ProjectM36.Attribute (attributesFromList)
+import ProjectM36.Error
 import System.Random
 
 main :: IO ()           
@@ -40,7 +43,9 @@ testList = TestList [testBootstrapDB,
                      testDBSimplePersistence,
                      testFunctionPersistence,
                      testMerkleHashValidation,
-                     testTransactionDirectorySizeGrowth
+                     testTransactionDirectorySizeGrowth,
+                     testIncrementalRelVarPersistence,
+                     testInterruptedLogWrite
                      ]
 
 stamp' :: UTCTime
@@ -117,7 +122,6 @@ testMerkleHashValidation = TestCase $
     Right graph -> do
       let trans = transactionHeadsForGraph graph M.! "master"
           updatedTrans = Transaction (transactionId trans) (transactionInfo trans) updatedSchemas
-          transactionDir' = dbdir </> show (transactionId trans)
           updatedSchemas =
             case T.schemas trans of
               Schemas ctx sschemas ->
@@ -136,9 +140,8 @@ testMerkleHashValidation = TestCase $
       --validate and fail
       let val'' = TG.validateMerkleHashes maliciousGraph
       assertEqual "loaded graph merkle hashes" (Left [MerkleValidationError (transactionId trans) regMerkleHash malMerkleHash]) val''
-      --delete existing transaction directory
-      removeDirectoryRecursive transactionDir'
-      writeTransaction NoDiskSync dbdir (UncommittedTransaction updatedTrans)
+      --replace the transaction log with one which holds the altered transaction under its original hash
+      _ <- transactionGraphPersist NoDiskSync dbdir maliciousGraph
 
       --read graph from disk
       eConnFail <- connectProjectM36 connInfo
@@ -217,3 +220,95 @@ getDirectorySize dir = do
             then getDirectorySize path'
             else getFileSize path' 
     pure $ sum sizes        
+
+eventAttrs :: Attributes
+eventAttrs = attributesFromList [Attribute "id" IntegerAtomType, Attribute "payload" TextAtomType]
+
+insertEvent :: Integer -> DatabaseContextExpr
+insertEvent i = Insert "event" (MakeRelationFromExprs Nothing (TupleExprs () [TupleExpr (M.fromList [("id", NakedAtomExpr (IntegerAtom i)),
+                                                                                                    ("payload", NakedAtomExpr (TextAtom "created"))])]))
+
+eventWithId :: Integer -> RestrictionPredicateExpr
+eventWithId i = AttributeEqualityPredicate "id" (NakedAtomExpr (IntegerAtom i))
+
+-- commits which change a few tuples of a large relation variable are stored as the change, survive reopening with valid hashes, and keep their key
+testIncrementalRelVarPersistence :: Test
+testIncrementalRelVarPersistence = TestCase $
+  withSystemTempDirectory "m36testdb" $ \tempdir -> do
+    rando <- initStdGen
+    let dbdir = tempdir </> "db"
+        connInfo = InProcessConnectionInfo (MinimalPersistence dbdir) emptyNotificationCallback [] basicDatabaseContext rando adminRoleName
+        eventCount = 300
+        run sess conn expr = assertIOEither (executeDatabaseContextExpr sess conn expr)
+        events sess conn = assertIOEither (executeRelationalExpr sess conn (RelationVariable "event" ()))
+        expected payloads = mkRelationFromList eventAttrs [[IntegerAtom i, TextAtom payload] | (i, payload) <- payloads]
+    conn <- assertIOEither $ connectProjectM36 connInfo
+    sess <- assertIOEither $ createSessionAtHead conn "master"
+    run sess conn (Define "event" (map NakedAttributeExpr (V.toList (attributesVec eventAttrs))))
+    run sess conn (databaseContextExprForUniqueKey "event" ["id"])
+    assertIOEither $ commit sess conn
+    sizes <- forM [1 .. eventCount] $ \i -> do
+      run sess conn (insertEvent i)
+      assertIOEither $ commit sess conn
+      getFileSize (transactionLogPath dbdir)
+    -- the log grows by the same small amount for the first inserts as for the last ones
+    let growth = zipWith (-) (drop 1 sizes) sizes
+    assertBool ("log growth per commit: " <> show (maximum growth)) (maximum growth < 600)
+    -- the key is enforced
+    dup <- executeDatabaseContextExpr sess conn (Insert "event" (MakeRelationFromExprs Nothing (TupleExprs () [TupleExpr (M.fromList [("id", NakedAtomExpr (IntegerAtom 1)), ("payload", NakedAtomExpr (TextAtom "duplicate"))])])))
+    assertEqual "key violation" (Left (InclusionDependencyCheckError "event_id_key" Nothing)) dup
+    -- update and delete single tuples
+    run sess conn (Update "event" (M.singleton "payload" (NakedAtomExpr (TextAtom "updated"))) (eventWithId 2))
+    assertIOEither $ commit sess conn
+    run sess conn (Delete "event" (eventWithId 3))
+    assertIOEither $ commit sess conn
+    let finalEvents = expected ([(1, "created"), (2, "updated")] <> [(i, "created") | i <- [4 .. eventCount]])
+    beforeClose <- events sess conn
+    assertEqual "events before reopening" finalEvents (Right beforeClose)
+    close conn
+
+    conn' <- assertIOEither $ connectProjectM36 connInfo
+    sess' <- assertIOEither $ createSessionAtHead conn' "master"
+    val <- C.validateMerkleHashes sess' conn'
+    assertEqual "merkle hashes after reopening" (Right ()) val
+    afterReopen <- events sess' conn'
+    assertEqual "events after reopening" finalEvents (Right afterReopen)
+    found <- assertIOEither $ executeRelationalExpr sess' conn' (Restrict (eventWithId 2) (RelationVariable "event" ()))
+    assertEqual "lookup by key" (expected [(2, "updated")]) (Right found)
+    -- the key is still enforced after reopening and the database keeps accepting commits
+    dup' <- executeDatabaseContextExpr sess' conn' (Update "event" (M.singleton "id" (NakedAtomExpr (IntegerAtom 1))) (eventWithId 2))
+    assertEqual "key violation after reopening" (Left (InclusionDependencyCheckError "event_id_key" Nothing)) dup'
+    run sess' conn' (insertEvent (eventCount + 1))
+    assertIOEither $ commit sess' conn'
+    close conn'
+
+-- the remains of an interrupted write at the end of the log are ignored and replaced by the next commit
+testInterruptedLogWrite :: Test
+testInterruptedLogWrite = TestCase $
+  withSystemTempDirectory "m36testdb" $ \tempdir -> do
+    rando <- initStdGen
+    let dbdir = tempdir </> "db"
+        connInfo = InProcessConnectionInfo (MinimalPersistence dbdir) emptyNotificationCallback [] basicDatabaseContext rando adminRoleName
+        commitX conn val = do
+          sess <- assertIOEither $ createSessionAtHead conn "master"
+          assertIOEither $ executeDatabaseContextExpr sess conn (Assign "x" (ExistingRelation val))
+          assertIOEither $ commit sess conn
+        readX conn = do
+          sess <- assertIOEither $ createSessionAtHead conn "master"
+          executeRelationalExpr sess conn (RelationVariable "x" ())
+    conn <- assertIOEither $ connectProjectM36 connInfo
+    commitX conn relationTrue
+    close conn
+    -- half an entry: a length which promises more bytes than follow
+    BS.appendFile (transactionLogPath dbdir) (BS.pack [0, 0, 1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+
+    conn' <- assertIOEither $ connectProjectM36 connInfo
+    x <- readX conn'
+    assertEqual "committed state survives" (Right relationTrue) x
+    commitX conn' relationFalse
+    close conn'
+
+    conn'' <- assertIOEither $ connectProjectM36 connInfo
+    x' <- readX conn''
+    assertEqual "commit after an interrupted write" (Right relationFalse) x'
+    close conn''

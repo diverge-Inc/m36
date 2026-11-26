@@ -129,7 +129,9 @@ data RelationalError = NoSuchAttributeNamesError (S.Set AttributeName)
 
 data PersistenceError = InvalidDirectoryError FilePath | 
                         MissingTransactionError TransactionId |
-                        WrongDatabaseFormatVersionError String String
+                        WrongDatabaseFormatVersionError String String |
+                        CorruptTransactionError TransactionId String |
+                        CorruptTransactionLogError String
                       deriving (Show, Eq, Generic, NFData)
 
 --collapse list of errors into normal error- if there is just one, just return one

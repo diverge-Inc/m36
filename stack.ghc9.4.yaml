@@ -29,7 +29,6 @@ extra-deps:
   - crypton-x509-validation-1.8.0
   - crypton-connection-0.4.5
   - crypton-pem-0.3.0
-  - linux-xattr-0.1.1.0
   - tls-2.2.0
   - tls-session-manager-0.0.8
   - crypto-token-0.1.2

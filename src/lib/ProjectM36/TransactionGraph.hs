@@ -25,7 +25,7 @@ import ProjectM36.ReferencedTransactionIds
 import ProjectM36.DatabaseContext.Fields
 
 import Codec.Winery
-import Control.Monad (foldM, forM, unless, when)
+import Control.Monad (foldM, forM, when)
 import Control.Monad.Except
 import Control.Monad.Reader
 import qualified Data.Vector as V
@@ -36,6 +36,8 @@ import qualified Data.List.NonEmpty as NE
 import Data.Time.Clock
 import qualified Data.Text as T
 import GHC.Generics
+import Control.DeepSeq (NFData, rnf)
+import Control.Parallel.Strategies (using, parListChunk, rdeepseq)
 import Data.Either (lefts, rights, isRight)
 import Control.Arrow
 import Data.Maybe
@@ -148,7 +150,6 @@ addTransactionToGraph headName (UncommittedTransaction newTrans) graph = do
   let parentIds' = parentIds newTrans
       newId = transactionId newTrans
       validateIds ids = mapM (`transactionForId` graph) (S.toList ids)
-  childTs <- childTransactions newTrans graph
   --validate that the parent transactions are in the graph
   _ <- validateIds parentIds'
   when (S.size parentIds' < 1) (Left $ NewTransactionMissingParentError newId)
@@ -156,9 +157,8 @@ addTransactionToGraph headName (UncommittedTransaction newTrans) graph = do
   case transactionForHead headName graph of
     Nothing -> pure () -- any headName is OK
     Just trans -> when (S.notMember (transactionId trans) parentIds') (Left (HeadNameSwitchingHeadProhibitedError headName))
-  --validate that the transaction has no children
-  unless (S.null childTs) (Left $ NewTransactionMayNotHaveChildrenError newId)
   --validate that the trasaction's id is unique
+  --(a transaction can only name parents which are already in the graph, so a transaction with an unused id cannot have children and there is no need to scan the whole graph for them)
   when (isRight (transactionForId newId graph)) (Left (TransactionIdInUseError newId))
   --replace all references to UncommittedTransactionMarker to new transaction id
   let newTrans' = newTransUncommittedReplace newTrans
@@ -175,8 +175,9 @@ newTransUncommittedReplace :: Transaction -> Transaction
 newTransUncommittedReplace trans@(Transaction tid tinfo (Schemas ctx sschemas)) =
   Transaction tid tinfo (Schemas fixedContext sschemas)
   where
+  -- expressions without the uncommitted marker are left untouched (not rebuilt) so that unchanged relation variables remain shared with the parent transaction
   uncommittedReplaceRelVars (ValueMarker rvs) =
-    ValueMarker $ M.map (fmap uncommittedReplaceMarker) rvs
+    ValueMarker $ M.map (\expr -> if UncommittedContextMarker `elem` expr then fmap uncommittedReplaceMarker expr else expr) rvs
   uncommittedReplaceRelVars e@NotChangedSinceMarker{} = e
   
   uncommittedReplaceMarker UncommittedContextMarker = TransactionMarker tid
@@ -638,13 +639,20 @@ addMerkleHash graph trans = Transaction (transactionId trans) newInfo (schemas t
     newInfo = (transactionInfo trans) { merkleHash = calculateMerkleHash trans graph }
   -- the new hash includes the parents' ids, the current id, and the hash of the context, and the merkle hashes of the parent transactions
 calculateMerkleHash :: Transaction -> TransactionGraph -> MerkleHash
-calculateMerkleHash trans graph = hashTransaction trans parentTranses
+calculateMerkleHash trans graph = hashTransaction trans parentTranses (firstParentRelationVariables trans graph)
   where
     parentTranses =
       case transactionsForIds (parentIds trans) graph of
         Left RootTransactionTraversalError -> mempty
         Left e -> error ("failed to find transaction in Merkle hash construction: " ++ show e)
         Right t -> t
+
+-- | The relation variables of the first parent, against which the changes of a transaction are expressed. Empty for a root transaction.
+firstParentRelationVariables :: Transaction -> TransactionGraph -> RelationVariables
+firstParentRelationVariables trans graph =
+  case transactionForId (NE.head (parents (transactionInfo trans))) graph of
+    Left _ -> M.empty
+    Right parentTrans -> either (const M.empty) id (resolveDBC' graph (concreteDatabaseContext parentTrans) relationVariables)
 
 validateMerkleHash :: Transaction -> TransactionGraph -> Either MerkleValidationError ()
 validateMerkleHash trans graph =
@@ -657,15 +665,19 @@ validateMerkleHash trans graph =
 data MerkleValidationError = MerkleValidationError TransactionId MerkleHash MerkleHash
   deriving (Show,Eq, Generic)
 
+instance NFData MerkleValidationError where
+  rnf (MerkleValidationError tid expected actual) = rnf tid `seq` rnf expected `seq` rnf actual
+
 validateMerkleHashes :: TransactionGraph -> Either [MerkleValidationError] ()
 validateMerkleHashes graph =
   if null errs then pure () else Left errs
   where
-    errs = S.foldr validateTrans [] (transactionsForGraph graph)
-    validateTrans trans acc =
+    -- the transactions are validated independently of each other, so spread them over the available cores
+    errs = concat (map validateTrans (S.toList (transactionsForGraph graph)) `using` parListChunk 256 rdeepseq)
+    validateTrans trans =
       case validateMerkleHash trans graph of
-        Left err -> err : acc
-        _ -> acc
+        Left err -> [err]
+        _ -> []
 
 -- | Ensure that referenced transactions remain in the graph.
 validateConnectivity :: TransactionGraph -> Either RelationalError TransactionGraph

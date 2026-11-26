@@ -12,6 +12,7 @@ import ProjectM36.Cache.RelationalExprCache as RECache
 import ProjectM36.DatabaseContext.Types
 import ProjectM36.Relation (RestrictionFilter, ContextTuples, attributes, contextTupleAtomForAttributeName, tupleSet)
 import ProjectM36.WithNameExpr
+import qualified ProjectM36.TupleStore as TStore
 import Streamly.Data.Stream (Stream)
 import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.Data.Stream.Prelude as Stream
@@ -336,9 +337,14 @@ executePlan plan ctxTuples gfEnv cacheKeyBlackList cache = do
             --potential optimization- lookup attrs in advance to rename the correct vector index
             pure (Right (streamRelationMap newAttrs (pure . tupleRenameAttributes attrsAssoc) relS))
             
-    RestrictTupleStreamPlan restrictionFilter _predExpr expr () _origExpr ->
+    RestrictTupleStreamPlan restrictionFilter predExpr expr () _origExpr ->
       checkCacheOr $ do
-        eStream <- executePlan expr ctxTuples gfEnv cacheKeyBlackList cache
+        eStream <- case expr of
+          -- equality on indexed attributes of a materialized relation: start from the tuples found through the index instead of from all tuples (the complete predicate is still applied below)
+          ExistingRelationPlan (Relation attrs store) ()
+            | Just candidates <- TStore.storeLookupByEqualities (TStore.predicateEqualities predExpr) store ->
+                pure (Right (StreamRelation attrs (Stream.fromList candidates)))
+          _ -> executePlan expr ctxTuples gfEnv cacheKeyBlackList cache
         case eStream of
           Left err -> pure (Left err)
           Right (StreamRelation attrs tupS) -> do

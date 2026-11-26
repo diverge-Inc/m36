@@ -2,6 +2,7 @@ module ProjectM36.Key where
 import ProjectM36.Base
 import ProjectM36.Relation
 import qualified Data.Set as S
+import qualified Data.Map as M
 import qualified Data.Text as T
 #if __GLASGOW_HASKELL__ < 804
 import Data.Monoid
@@ -35,6 +36,19 @@ inclusionDependencyForKey attrNames relExpr = --InclusionDependency name (exprCo
     exprCount expr = projectionForCount (Extend (AttributeExtendTupleExpr "b" (FunctionAtomExpr "count" [AttributeAtomExpr "a"] () )) (exprAsSubRelation expr))
     projectionForCount = Project (AttributeNames $ S.fromList ["b"])
     equalityExpr = NotEquals (exprCount relExpr) (exprCount (projectedOnKeys relExpr))
+
+-- | If the inclusion dependency is a uniqueness constraint made by 'inclusionDependencyForKey' over a single relation variable, return the relation variable and the attributes of the key. Such constraints can be checked with an index instead of by evaluating the constraint.
+keyForInclusionDependency :: InclusionDependency -> Maybe (RelVarName, S.Set AttributeName)
+keyForInclusionDependency incDep =
+  case incDep of
+    InclusionDependency (NotEquals _ (Project _ (Extend _ (Extend (AttributeExtendTupleExpr _ (RelationAtomExpr (Project attrNames@(AttributeNames names) rvExpr@(RelationVariable rvName ())))) _)))) _
+      | incDep == inclusionDependencyForKey attrNames rvExpr -> Just (rvName, names)
+    _ -> Nothing
+
+-- | The keys declared by the inclusion dependencies, by relation variable.
+keysForInclusionDependencies :: InclusionDependencies -> M.Map RelVarName [S.Set AttributeName]
+keysForInclusionDependencies incDeps =
+  M.fromListWith (<>) [(rvName, [names]) | Just (rvName, names) <- map keyForInclusionDependency (M.elems incDeps)]
 
 -- | Create a 'DatabaseContextExpr' which can be used to add a uniqueness constraint to attributes on one relation variable.
 databaseContextExprForUniqueKey :: RelVarName -> [AttributeName] -> DatabaseContextExpr

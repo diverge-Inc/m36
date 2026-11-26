@@ -125,6 +125,8 @@ evalGraphRefRelationalExprWithCache :: RandomGen r => r -> GraphRefRelationalExp
 evalGraphRefRelationalExprWithCache rando gfEnv gfExpr cache =
   case planGraphRefRelationalExpr gfExpr gfEnv of
     Left err -> pure (Left err)
+    -- the expression is a relation value already (such as a materialized relation variable): there is nothing to execute, copy, or cache
+    Right (ExistingRelationPlan rel ()) -> pure (Right rel)
     Right plan -> do
       startExecTime <- getCurrentTime
       exec <- executePlan plan mempty gfEnv mempty cache -- try/catch to handle exceptions

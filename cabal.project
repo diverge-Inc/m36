@@ -9,10 +9,6 @@ package *
 -- loosens exactly the same bounds for the Nix build (instead of jailbreaking).
 -- Remove an entry once the package publishes a release or revision with higher bounds.
 
--- linux-xattr-0.1.1.0 pins bytestring == 0.10.*
-if os(linux)
-  allow-newer: linux-xattr:bytestring
-
 -- barbies-th-0.1.11: base < 4.20, template-haskell < 2.22.
 -- Note: since template-haskell 2.21 (GHC 9.8) barbies-th also needs a one-line
 -- source fix (nix/patches/barbies-th-template-haskell-2.21.patch), which the Nix

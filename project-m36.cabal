@@ -230,7 +230,9 @@ Library
                      ProjectM36.Trace,
                      ProjectM36.Streaming.Tuple,
                      ProjectM36.Streaming.RelationalExpression,
-                     ProjectM36.Streaming.Compat,     
+                     ProjectM36.Streaming.Compat,
+                     ProjectM36.TupleStore,
+                     ProjectM36.RelationVariablesDelta,     
                      ProjectM36.Cache.RelationalExprCache,
                      ProjectM36.Cache.Tuple,
                      ProjectM36.RelExprSize,
@@ -264,8 +266,6 @@ Library
       GHC-Options: -rdynamic
       C-sources: cbits/DirectoryFsync.c, cbits/darwin_statfs.c, cbits/darwin_memory.c
       Build-Depends: unix
-    if os(linux)
-      Build-Depends: linux-xattr
     CC-Options: -fPIC
     Hs-Source-Dirs: ./src/lib
     Default-Language: Haskell2010
@@ -670,6 +670,13 @@ benchmark ondiskclient
     HS-Source-Dirs: ./src/bin
     if impl(ghc <9.4)
       GHC-Options: -eventlog
+
+benchmark append-commit
+    import: commontest
+    type: exitcode-stdio-1.0
+    main-is: benchmark/AppendCommit.hs
+    GHC-Options: -O2 -rtsopts -Wall -threaded
+    HS-Source-Dirs: ./src/bin
 
 Test-Suite test-server
     import: commontest

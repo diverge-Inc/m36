@@ -74,17 +74,6 @@ in
       check = false;
     };
 
-    # Linux でだけ使う。bytestring == 0.10.* の制約で nixpkgs では broken 扱い。
-    # GHC 9.10 の bytestring 0.12 まで広げる
-    linux-xattr = {
-      imports = [
-        (loosenBounds "linux-xattr.cabal" [
-          { from = "bytestring == 0.10.*"; to = "bytestring >= 0.10 && < 0.13"; }
-        ])
-      ];
-      broken = false;
-    };
-
     # project-m36 が無条件に依存している。テストは /proc を読むので Linux でしか通らない
     system-linux-proc.check = false;
   };

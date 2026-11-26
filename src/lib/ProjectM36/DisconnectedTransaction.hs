@@ -6,6 +6,7 @@ import ProjectM36.IsomorphicSchema.Types (Schemas)
 import ProjectM36.DatabaseContext as DBC
 import ProjectM36.DatabaseContext.Types as DBC
 import GHC.Generics
+import ProjectM36.ValueMarker
 
 -- | Every set of modifications made to the database are atomically committed to the transaction graph as a transaction.
 
@@ -39,9 +40,18 @@ freshTransaction :: CurrentHead -> TransactionId -> TransactionRefSchemas -> Dis
 freshTransaction head' tid schemas =
   DisconnectedTransaction {
   disconTransactionId = tid,
-  disconSchemas = schemas { Schema.concreteDatabaseContext = freshDatabaseContext tid (Schema.concreteDatabaseContext schemas) },
+  disconSchemas = freshSchemas tid schemas,
   disconCurrentHead = head'
   }
+
+-- | Schemas for the workspace on top of the just-committed transaction: everything refers back to the committed transactions.
+freshSchemas :: TransactionId -> TransactionRefSchemas -> TransactionRefSchemas
+freshSchemas tid schemas =
+  schemas { Schema.concreteDatabaseContext = freshDatabaseContext tid (Schema.concreteDatabaseContext schemas),
+            Schema.subschemas = case Schema.subschemas schemas of
+                                  ValueMarker _ -> NotChangedSinceMarker tid
+                                  marker@NotChangedSinceMarker{} -> marker
+          }
 
 
 freshTransaction' :: CurrentHead -> TransactionId -> Schemas DatabaseContext -> DisconnectedTransaction
@@ -52,6 +62,5 @@ freshTransaction' head' tid schemas =
   disconCurrentHead = head'
   }
   where
-    schemas' = schemas { Schema.concreteDatabaseContext = freshDatabaseContext tid (Schema.concreteDatabaseContext schemas)
-                       }
+    schemas' = freshSchemas tid schemas
 

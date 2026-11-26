@@ -7,6 +7,16 @@
 * macOS: read memory statistics with `sysctl` instead of spawning `memory_pressure` on every query; fixes queries failing when `/usr/bin` is not on `PATH` and the free-memory estimate on 16 KiB-page (Apple Silicon) machines
 * drop `-fexternal-interpreter` from the library, which made GHC 9.10 panic while running Template Haskell
 * run the full test suite in the Nix build (previously disabled)
+* make the cost of a commit independent of the size of the database and the length of its history (see [docs/append_benchmark.markdown](docs/append_benchmark.markdown) for measurements against PostgreSQL):
+  * **new on-disk format (version 9); databases written by earlier versions cannot be opened** (as with previous format changes, there is no migration)
+  * the transaction graph is persisted as one append-only transaction log instead of a directory per transaction; a commit appends the change of the transaction relative to its parent (see [docs/filesystem-persistence.markdown](docs/filesystem-persistence.markdown))
+  * the value of a relation variable is kept as a materialized relation in a persistent (structure-sharing) set; `insert`, `delete` and `update` are applied to the value right away instead of piling up as an expression which grows with every statement
+  * the Merkle hash of a transaction covers the change of the relation variables relative to the first parent instead of all relation variables, so hashing and validating cost time proportional to the changes; hashes therefore differ from those of earlier versions
+  * uniqueness constraints made with `databaseContextExprForUniqueKey`/`inclusionDependencyForKey` (TutorialD `key`) are backed by an index: they are checked without evaluating the constraint, and restrictions which compare the key attributes with constants find their tuples through the index
+  * a statement re-checks only the inclusion dependencies which mention the relation variable it changed
+  * transactions are found by id in logarithmic time instead of by scanning all transactions; markers for unchanged subschemas no longer form a chain which grows with every commit
+  * behaviour change: a `delete` or `update` which changes no tuple no longer marks the session as dirty
+  * drop the `linux-xattr` dependency (extended attributes were only written for the removed per-relation-variable files)
 
 # ? (v1.2.7)
 

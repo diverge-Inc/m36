@@ -1,52 +1,56 @@
+{-# LANGUAGE DerivingVia, DeriveGeneric, ScopedTypeVariables, BangPatterns #-}
 module ProjectM36.TransactionGraph.Persist where
 import ProjectM36.Error
-import ProjectM36.Transaction
 import ProjectM36.Transaction.Persist
+import ProjectM36.TransactionGraph
 import ProjectM36.TransactionGraph.Types
 import ProjectM36.Transaction.Types
 import ProjectM36.RelationalExpression
 import ProjectM36.Base
 import ProjectM36.ScriptSession
-import ProjectM36.Persist (writeFileSync, renameSync, DiskSync)
+import ProjectM36.DatabaseContext.Types
+import ProjectM36.ValueMarker
+import ProjectM36.IsomorphicSchema.Types (Schemas(Schemas))
+import ProjectM36.Persist (AppendFile, openAppendFile, appendFileSize, truncateAppendFile, appendBytesSync, writeFileBytesSync, renameSync, DiskSync)
 import ProjectM36.FileLock
 import System.Directory
 import System.FilePath
-import System.IO.Temp
-import Data.Time.Clock.POSIX
-import qualified Data.UUID as U
+import System.IO
 import qualified Data.Set as S
 import qualified Data.Map as M
-import qualified Data.Text as T
-import Data.Text.Encoding
-import Control.Monad (foldM)
+import Control.Monad (foldM, when)
 import Data.Either (isRight)
-import Data.Maybe (fromMaybe)
 import qualified Data.List as L
+import qualified Data.List.NonEmpty as NE
 import Control.Exception.Base
 import qualified Data.ByteString as BS
-import qualified Data.Text.Encoding as TE
-import Data.ByteString (ByteString)
-#if __GLASGOW_HASKELL__ < 804
-import Data.Monoid
-#endif
+import qualified Data.ByteString.Builder as BB
+import qualified Data.ByteString.Lazy as BL
 import qualified Crypto.Hash.SHA256 as SHA256
-import Control.Arrow
-import Data.Time.Clock
-import Data.Text.Read
 import System.FilePath.Glob
-import Data.Tuple
-
-type LockFileHash = ByteString
+import Codec.Winery
+import Data.Proxy
+import Data.Bits (shiftL, (.|.))
+import GHC.Generics (Generic)
 
 {-
-The "m36vX" file at the top-level of the destination directory contains the the transaction graph as a set of transaction ids referencing their parents (1 or more)
-Each Transaction is written to it own directory named by its transaction id. Partially written transactions ids are prefixed with a "." to indicate incompleteness in the graph.
+The database directory contains the transaction log "m36vX" (X is the format version), a lock file, the login roles database, and the compiled modules of functions.
 
-Persistence requires a POSIX-compliant, journaled-metadata filesystem. Extended attributes (when supported by the filesystem are used to mark which relation variable name maps to which file. Relation variable names may contain arbitrary UTF-8 (such as colons, newlines, etc.) which may not be suitable for direct use in file names.
+The transaction log is an append-only file. Every commit appends one entry holding the new transactions and the heads of the graph. A transaction is stored as its change relative to its parent (see 'TransactionRecord'), so the size of an entry depends on what the commit changed, not on the size of the database or the length of its history. Opening the database replays the log.
+
+An entry is framed as:
+
+  4 bytes  length of the payload (big endian)
+  8 bytes  first 8 bytes of the SHA-256 of the payload
+  n bytes  payload ('LogEntry' serialised with winery)
+
+An incomplete or damaged entry at the end of the log (a crash in the middle of a write) is ignored when reading and cut off before the next entry is appended.
+
+Persistence requires a POSIX-compliant, journaled-metadata filesystem.
 -}
 
 expectedVersion :: Int
-expectedVersion = 8
+expectedVersion = 9
 
 transactionLogFileName :: FilePath 
 transactionLogFileName = "m36v" ++ show expectedVersion
@@ -54,16 +58,23 @@ transactionLogFileName = "m36v" ++ show expectedVersion
 transactionLogPath :: FilePath -> FilePath
 transactionLogPath dbdir = dbdir </> transactionLogFileName
 
-headsPath :: FilePath -> FilePath
-headsPath dbdir = dbdir </> "heads"
-
 lockFilePath :: FilePath -> FilePath
 lockFilePath dbdir = dbdir </> "lockFile"
 
+-- | How many bytes of the transaction log this process has applied to its in-memory graph. If the log is longer, another process has committed in the meantime.
+type LogPosition = Integer
+
+-- | One entry of the transaction log.
+data LogEntry = LogEntry {
+  leTransactions :: [TransactionRecord], -- ^ new transactions, parents before children
+  leHeads :: [(HeadName, TransactionId)] -- ^ all heads of the graph after this entry
+  }
+  deriving Generic
+  deriving Serialise via WineryRecord LogEntry
+
 {-
 verify that the database directory is valid or bootstrap it 
--note: checking for the existence of every transaction may be prohibitively expensive
-- return error or lock file handle which is already locked with a read lock
+- return error or lock file handle
 -}
 
 checkForOtherVersions :: FilePath -> IO (Either PersistenceError ())
@@ -74,7 +85,7 @@ checkForOtherVersions dbdir = do
     [] -> Right ()
     x : _ -> Left $ WrongDatabaseFormatVersionError transactionLogFileName x
 
-setupDatabaseDir :: DiskSync -> FilePath -> TransactionGraph -> IO (Either PersistenceError (LockFile, LockFileHash))
+setupDatabaseDir :: DiskSync -> FilePath -> TransactionGraph -> IO (Either PersistenceError LockFile)
 setupDatabaseDir sync dbdir bootstrapGraph = do
   dbdirExists <- doesDirectoryExist dbdir
   eWrongVersion <- checkForOtherVersions dbdir
@@ -82,11 +93,8 @@ setupDatabaseDir sync dbdir bootstrapGraph = do
     Left err -> pure (Left err)
     Right () -> do
       m36exists <- doesFileExist (transactionLogPath dbdir)  
-      if dbdirExists && m36exists then do
-        --no directories to write, just 
-        locker <- openLockFile (lockFilePath dbdir)
-        gDigest <- bracket_ (lockFile locker WriteLock) (unlockFile locker) (readGraphTransactionIdFileDigest dbdir)
-        pure (Right (locker, gDigest))
+      if dbdirExists && m36exists then
+        Right <$> openLockFile (lockFilePath dbdir)
       else if not m36exists then 
         Right <$> bootstrapDatabaseDir sync dbdir bootstrapGraph
          else
@@ -94,156 +102,133 @@ setupDatabaseDir sync dbdir bootstrapGraph = do
 {- 
 initialize a database directory with the graph from which to bootstrap- return lock file handle which must be closed by the caller
 -}
-bootstrapDatabaseDir :: DiskSync -> FilePath -> TransactionGraph -> IO (LockFile, LockFileHash)
+bootstrapDatabaseDir :: DiskSync -> FilePath -> TransactionGraph -> IO LockFile
 bootstrapDatabaseDir sync dbdir bootstrapGraph = do
   createDirectory dbdir
   locker <- openLockFile (lockFilePath dbdir)
-  createDirectoryIfMissing False (ProjectM36.TransactionGraph.Persist.objectFilesPath dbdir)
-  digest  <- bracket_ (lockFile locker WriteLock) (unlockFile locker) (transactionGraphPersist sync dbdir bootstrapGraph)
-  pure (locker, digest)
+  createDirectoryIfMissing False (objectFilesPath dbdir)
+  _ <- bracket_ (lockFile locker WriteLock) (unlockFile locker) (transactionGraphPersist sync dbdir bootstrapGraph)
+  pure locker
 
-objectFilesPath :: FilePath -> FilePath
-objectFilesPath dbdir = dbdir </> "compiled_modules"
+-- | The current size of the transaction log.
+transactionLogSize :: FilePath -> IO LogPosition
+transactionLogSize dbdir = getFileSize (transactionLogPath dbdir)
 
--- | Write an entire transaction graph to storage.
-transactionGraphPersist :: DiskSync -> FilePath -> TransactionGraph -> IO LockFileHash
+-- | Open the transaction log for appending.
+openTransactionLog :: FilePath -> IO AppendFile
+openTransactionLog dbdir = openAppendFile (transactionLogPath dbdir)
+
+-- | Write an entire transaction graph to storage, replacing the transaction log. Not for use on a database which is open, since open connections keep appending to the log they opened.
+transactionGraphPersist :: DiskSync -> FilePath -> TransactionGraph -> IO LogPosition
 transactionGraphPersist sync destDirectory graph = do
-  let tgWriteInfo =
-        TransactionGraphIncrementalWriteInfo
-        {
-          uncommittedTransactions = newTransactions,
-          newGraph = graph
-        }
-      newTransactions = S.map UncommittedTransaction (transactionsForGraph graph)
-  transactionGraphPersistIncremental sync destDirectory tgWriteInfo 
+  let entry = encodeLogEntry (mkLogEntry graph (transactionsForGraph graph))
+      tempPath = destDirectory </> ("." <> transactionLogFileName <> ".tmp")
+  writeFileBytesSync sync tempPath entry
+  renameSync sync tempPath (transactionLogPath destDirectory)
+  pure (fromIntegral (BS.length entry))
 
+-- | Append the new transactions and the heads of the new graph to the transaction log. The position is how far this process has read the log; anything after it is the remains of an interrupted write and is cut off. Returns the new position. The caller must hold the write lock.
+transactionGraphPersistIncremental :: DiskSync -> AppendFile -> LogPosition -> TransactionGraphIncrementalWriteInfo -> IO LogPosition
+transactionGraphPersistIncremental sync logFile position tgWriteInfo = do
+  let entry = encodeLogEntry (mkLogEntry (newGraph tgWriteInfo) (S.map _uncommittedTransaction (uncommittedTransactions tgWriteInfo)))
+  size <- appendFileSize logFile
+  when (size > position) (truncateAppendFile logFile position)
+  appendBytesSync sync logFile entry
+  pure (position + fromIntegral (BS.length entry))
 
--- | The incremental writer writes the transactions ids specified by the second argument.
-transactionGraphPersistIncremental :: DiskSync -> FilePath -> TransactionGraphIncrementalWriteInfo -> IO LockFileHash
-transactionGraphPersistIncremental sync destDirectory tgWriteInfo = do
-  mapM_ (writeTransaction sync destDirectory) (S.toList (uncommittedTransactions tgWriteInfo))
-  --write graph file
-  newDigest <- writeGraphTransactionIdFile sync destDirectory (newGraph tgWriteInfo)
-  --write heads file
-  transactionGraphHeadsPersist sync destDirectory (newGraph tgWriteInfo)
-  pure newDigest
+mkLogEntry :: TransactionGraph -> S.Set Transaction -> LogEntry
+mkLogEntry graph newTransactions =
+  LogEntry { leTransactions = map (\trans -> transactionToRecord (firstParentRelationVariables trans graph) trans) (parentsFirst newTransactions),
+             leHeads = map (\(headName, trans) -> (headName, transactionId trans)) (M.toList (transactionHeadsForGraph graph)) }
 
--- There was a bug here via #128 because automerge added multiple transactions to the graph but this function used to only write the head transactions from the graph. Automerge creates multiple transactions, so these are now passed in as the second argument.
-{-
-transactionsPersist :: DiskSync -> [TransactionId] -> FilePath -> TransactionGraph -> IO ()
-transactionsPersist sync transIds destDirectory graphIn = mapM_ writeTrans transIds
-  where writeTrans tid =
-          case transactionForId tid graphIn of 
-            Left err -> error ("writeTransaction: " ++ show err)
-            Right trans -> writeTransaction sync destDirectory trans
--}
-{- 
-write graph heads to a file which can be atomically swapped
--}
---writing the heads in a directory is a synchronization nightmare, so just write the binary to a file and swap atomically
-transactionGraphHeadsPersist :: DiskSync -> FilePath -> TransactionGraph -> IO ()
-transactionGraphHeadsPersist sync dbdir graph = do
-  let headFileStr :: (HeadName, Transaction) -> T.Text
-      headFileStr (headName, trans) =  headName <> " " <> U.toText (transactionId trans)
-  withTempDirectory dbdir ".heads.tmp" $ \tempHeadsDir -> do
-    let tempHeadsPath = tempHeadsDir </> "heads"
-        headsStrLines = map headFileStr $ M.toList (transactionHeadsForGraph graph)
-    writeFileSync sync tempHeadsPath $ T.intercalate "\n" headsStrLines
-    renameSync sync tempHeadsPath (headsPath dbdir)
-
-transactionGraphHeadsLoad :: FilePath -> IO [(HeadName,TransactionId)]
-transactionGraphHeadsLoad dbdir = do
-  headsData <- readFile (headsPath dbdir)
-  let headsAssocs = map twowords (lines headsData)
-  return [(T.pack headName, uuid) | (headName, Just uuid) <- map (second U.fromString) headsAssocs]
-
-data Pos = One | Two
-
-twowords :: String -> (String, String)
-twowords s = swap $ snd $ foldr twowordfolder (One, ("","")) s
+-- | Order transactions so that every transaction comes after its parents (if they are in the set).
+parentsFirst :: S.Set Transaction -> [Transaction]
+parentsFirst transSet = go S.empty (S.toList transSet)
   where
-    twowordfolder ' ' (One, acc) = (Two,acc)
-    twowordfolder c (One, (a, b)) =  (One, (c:a, b))
-    twowordfolder c (Two, (a, b)) = (Two, (a, c:b))
-  
+    ids = S.map transactionId transSet
+    go _ [] = []
+    go emitted remaining =
+      let ready trans = all (\pid -> S.member pid emitted || S.notMember pid ids) (NE.toList (parents (transactionInfo trans)))
+          (now, later) = L.partition ready remaining
+      in if null now then
+           remaining -- cannot happen in an acyclic graph
+         else
+           now ++ go (foldr (S.insert . transactionId) emitted now) later
+
+encodeLogEntry :: LogEntry -> BS.ByteString
+encodeLogEntry entry = BL.toStrict (BB.toLazyByteString (BB.word32BE (fromIntegral (BS.length payload)) <> BB.byteString (BS.take 8 (SHA256.hash payload)) <> BB.byteString payload))
+  where
+    payload = serialiseOnly entry
+
+-- | Split log bytes into the payloads of the complete entries and the number of bytes they occupy.
+splitLogEntries :: BS.ByteString -> ([BS.ByteString], Int)
+splitLogEntries = go 0 []
+  where
+    go !consumed acc bytes
+      | BS.length bytes < 12 = done
+      | BS.length rest < len = done
+      | BS.take 8 (SHA256.hash payload) /= checksum = done
+      | otherwise = go (consumed + 12 + len) (payload : acc) (BS.drop len rest)
+      where
+        done = (reverse acc, consumed)
+        len = BS.foldl' (\n w -> (n `shiftL` 8) .|. fromIntegral w) 0 (BS.take 4 bytes)
+        checksum = BS.take 8 (BS.drop 4 bytes)
+        rest = BS.drop 12 bytes
+        payload = BS.take len rest
+
 {-  
 load any transactions which are not already part of the incoming transaction graph
 -}
-
 transactionGraphLoad :: FilePath -> TransactionGraph -> Maybe ScriptSession -> IO (Either PersistenceError TransactionGraph)
-transactionGraphLoad dbdir graphIn mScriptSession = do
-  --optimization: perform tail-bisection search to find last-recorded transaction in the existing stream- replay the rest
-  --read in all missing transactions from transaction directories and add to graph
-  uuidInfo <- readGraphTransactionIdFile dbdir
-  freshHeadsAssoc <- transactionGraphHeadsLoad dbdir
-  case uuidInfo of
-    Left err -> return $ Left err
-    Right info' -> do  
-      let folder eitherGraph transId = case eitherGraph of
-            Left err -> return $ Left err
-            Right graph -> readTransactionIfNecessary dbdir transId mScriptSession graph
-      loadedGraph <- foldM folder (Right graphIn) (map (\(tid,_,_) -> tid) info')
-      case loadedGraph of 
-        Left err -> return $ Left err
-        Right freshGraph -> do
-          let maybeTransHeads = [(headName, transactionForId uuid freshGraph) | (headName, uuid) <- freshHeadsAssoc]
-              freshHeads = M.fromList [(headName,trans) | (headName, Right trans) <- maybeTransHeads]
-          return $ Right $ TransactionGraph freshHeads (transactionsForGraph freshGraph)
-  
-{-  
-if the transaction with the TransactionId argument is not yet part of the graph, then read the transaction and add it - this does not update the heads
--}
-readTransactionIfNecessary :: FilePath -> TransactionId -> Maybe ScriptSession -> TransactionGraph -> IO (Either PersistenceError TransactionGraph)  
-readTransactionIfNecessary dbdir transId mScriptSession graphIn =
-  if isRight $ transactionForId transId graphIn then
-    --the transaction is already known and loaded- done
-    return $ Right graphIn
-    else do
-    trans <- readTransaction dbdir transId mScriptSession
-    case trans of
-      Left err -> return $ Left err
-      Right trans' -> return $ Right $ TransactionGraph (transactionHeadsForGraph graphIn) (S.insert trans' (transactionsForGraph graphIn))
-  
-writeGraphTransactionIdFile :: DiskSync -> FilePath -> TransactionGraph -> IO LockFileHash
-writeGraphTransactionIdFile sync destDirectory (TransactionGraph _ transSet) = writeFileSync sync graphFile uuidInfo >> pure digest
+transactionGraphLoad dbdir graphIn mScriptSession = fmap fst <$> transactionGraphLoadFrom dbdir 0 graphIn mScriptSession
+
+-- | Apply the entries of the transaction log after the position to the graph. Returns the new graph and the position up to which the log was read.
+transactionGraphLoadFrom :: FilePath -> LogPosition -> TransactionGraph -> Maybe ScriptSession -> IO (Either PersistenceError (TransactionGraph, LogPosition))
+transactionGraphLoadFrom dbdir position graphIn mScriptSession = do
+  eBytes <- try $ withBinaryFile (transactionLogPath dbdir) ReadMode $ \h -> do
+    hSeek h AbsoluteSeek position
+    BS.hGetContents h
+  case eBytes of
+    Left (err :: IOException) -> error (show err) --rationale- reading essential database files must fail hard
+    Right bytes -> do
+      let (payloads, consumed) = splitLogEntries bytes
+      case getDecoder (schema (Proxy :: Proxy LogEntry)) of
+        Left err -> pure (Left (CorruptTransactionLogError (show err)))
+        Right decoder -> do
+          eGraph <- foldM (\eGraph payload -> case eGraph of
+                                        Left err -> pure (Left err)
+                                        Right graph -> applyLogEntry dbdir mScriptSession graph (evalDecoder decoder payload)) (Right graphIn) payloads
+          pure ((\graph -> (graph, position + fromIntegral consumed)) <$> eGraph)
+
+applyLogEntry :: FilePath -> Maybe ScriptSession -> TransactionGraph -> LogEntry -> IO (Either PersistenceError TransactionGraph)
+applyLogEntry dbdir mScriptSession graphIn entry = do
+  eGraph <- foldM addRecord (Right graphIn) (leTransactions entry)
+  pure $ do
+    graph <- eGraph
+    headsAssoc <- mapM (\(headName, tid) -> case transactionForId tid graph of
+                                              Left _ -> Left (MissingTransactionError tid)
+                                              Right trans -> Right (headName, trans)) (leHeads entry)
+    pure (TransactionGraph (M.fromList headsAssoc) (transactionsForGraph graph))
   where
-    graphFile = transactionLogPath destDirectory
-    uuidInfo = T.intercalate "\n" graphLines
-    digest = SHA256.hash (encodeUtf8 uuidInfo)
-    graphLines = S.toList $ S.map graphLine transSet 
-    epochTime = realToFrac . utcTimeToPOSIXSeconds . timestamp :: Transaction -> Double
-    graphLine trans = U.toText (transactionId trans) 
-                      <> " " 
-                      <> T.pack (show (epochTime trans))
-                      <> " "
-                      <> T.intercalate " " (S.toList (S.map U.toText $ parentIds trans))
-    
-readGraphTransactionIdFileDigest :: FilePath -> IO LockFileHash
-readGraphTransactionIdFileDigest dbdir = do
-  let graphTransactionIdData = readUTF8FileOrError (transactionLogPath dbdir)
-  SHA256.hash . encodeUtf8 <$> graphTransactionIdData
-    
-readGraphTransactionIdFile :: FilePath -> IO (Either PersistenceError [(TransactionId, UTCTime, [TransactionId])])
-readGraphTransactionIdFile dbdir = do
-  --read in all transactions' uuids
-  let grapher line = let (tid,epochText,parentIds') = case T.words line of
-                           x:y:zs -> (x,y,zs)
-                           _ -> error "failed to parse transaction id file"
-                           in
-        (readUUID tid, readEpoch epochText, map readUUID parentIds')
-      readUUID uuidText = fromMaybe (error "failed to read uuid") (U.fromText uuidText)
-      readEpoch t = posixSecondsToUTCTime (realToFrac (either (error "failed to read epoch") fst (double t)))
-  Right . map grapher . T.lines <$> readUTF8FileOrError (transactionLogPath dbdir)
+    addRecord (Left err) _ = pure (Left err)
+    addRecord (Right graph) record
+      | isRight (transactionForId (trId record) graph) = pure (Right graph) --the transaction is already known and loaded
+      | otherwise = do
+          let baseRelVars = case transactionForId (NE.head (parents (trInfo record))) graph of
+                Left _ -> M.empty
+                Right parentTrans -> either (const M.empty) id (resolveDBC' graph (concreteDatabaseContext parentTrans) relationVariables)
+          eTrans <- recordToTransaction dbdir mScriptSession baseRelVars record
+          pure $ case eTrans of
+            Left err -> Left err
+            Right trans -> Right (TransactionGraph (transactionHeadsForGraph graph) (S.insert (withKeyIndexes graph trans) (transactionsForGraph graph)))
 
---rationale- reading essential database files must fail hard
-readUTF8FileOrError :: FilePath -> IO T.Text
-readUTF8FileOrError pathIn = do
-  eFileBytes <- try (BS.readFile pathIn) :: IO (Either IOError BS.ByteString)
-  case eFileBytes of 
-    Left err -> error (show err)
-    Right fileBytes ->
-      case TE.decodeUtf8' fileBytes of
-        Left err -> error (show err)
-        Right utf8Bytes -> pure utf8Bytes
-
-
+-- | Indexes are not stored. A relation variable inherits them from its previous version when its change is applied; this adds the ones which are missing because the relation variable or the key is new in this transaction.
+withKeyIndexes :: TransactionGraph -> Transaction -> Transaction
+withKeyIndexes graph trans@(Transaction tid tinfo (Schemas context sschemas)) =
+  case relationVariables context of
+    -- nothing to do: the relation variables are those of an earlier transaction (and the marker must stay as it is since it is part of what the Merkle hash covers)
+    NotChangedSinceMarker{} -> trans
+    ValueMarker relVars ->
+      case resolveDBC' graph context inclusionDependencies of
+        Left _ -> trans
+        Right incDeps -> Transaction tid tinfo (Schemas context { relationVariables = ValueMarker (ensureAllKeyIndexes incDeps relVars) } sschemas)

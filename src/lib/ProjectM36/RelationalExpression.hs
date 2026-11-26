@@ -8,6 +8,9 @@ module ProjectM36.RelationalExpression where
 import ProjectM36.Relation
 import ProjectM36.Tuple
 import qualified ProjectM36.TupleSet as TS
+import qualified ProjectM36.TupleStore as TStore
+import ProjectM36.Key (keyForInclusionDependency, keysForInclusionDependencies)
+import ProjectM36.RelationVariablesMentioned (relVarsMentioned)
 import ProjectM36.Base
 import qualified Data.UUID as U
 import ProjectM36.Error
@@ -28,7 +31,7 @@ import qualified ProjectM36.Attribute as A
 import qualified Data.Map as M
 import qualified Data.HashSet as HS
 import qualified Data.Set as S
-import Control.Monad (foldM, unless, when, forM_)
+import Control.Monad (foldM, unless, when, forM_, filterM)
 import Control.Monad.Except (ExceptT, MonadError, runExceptT, throwError, catchError)
 import Control.Monad.Reader (ReaderT, runReaderT, asks, ask, local)
 import qualified Control.Monad.Reader as R
@@ -265,7 +268,8 @@ setRelVar relVarName relExpr = do
   relExpr' <- resolve relExpr
   graph <- dbcGraph
   relVars <- resolveDBC relationVariables
-  let newRelVars = ValueMarker $ M.insert relVarName relExpr' relVars
+  incDeps <- resolveDBC inclusionDependencies
+  let newRelVars = ValueMarker $ M.insert relVarName (ensureKeyIndexes incDeps relVarName relExpr') relVars
       potentialContext = currentContext { relationVariables = newRelVars }
   --optimization: if the relexpr is unchanged, skip the update      
   if M.lookup relVarName relVars == Just relExpr then
@@ -273,9 +277,99 @@ setRelVar relVarName relExpr = do
     else do
     --determine when to check constraints
     tid <- dbcTransId
-    case checkConstraints potentialContext tid graph of
+    case checkConstraintsMentioning (Just relVarName) potentialContext tid graph of
       Left err -> dbErr err
       Right _ -> putStateContext potentialContext
+
+-- | Make sure that a materialized relation variable carries an index for every key declared on it, so that the keys can be checked (and tuples found by key) without scanning the relation.
+ensureKeyIndexes :: InclusionDependencies -> RelVarName -> GraphRefRelationalExpr -> GraphRefRelationalExpr
+ensureKeyIndexes incDeps relVarName expr =
+  maybe expr (`addKeyIndexes` expr) (M.lookup relVarName (keysForInclusionDependencies incDeps))
+
+-- | Add the indexes which are missing. An expression which has them all is returned as it is (not rebuilt), so that it remains shared with the transaction it came from.
+addKeyIndexes :: [S.Set AttributeName] -> GraphRefRelationalExpr -> GraphRefRelationalExpr
+addKeyIndexes keys expr@(ExistingRelation (Relation attrs store))
+  | lacksKeyIndexes keys expr = ExistingRelation (Relation attrs (foldr TStore.storeEnsureIndex store keys))
+  | otherwise = expr
+addKeyIndexes _ expr = expr
+
+-- | Whether the expression is a materialized relation which lacks an index for one of the keys.
+lacksKeyIndexes :: [S.Set AttributeName] -> GraphRefRelationalExpr -> Bool
+lacksKeyIndexes keys (ExistingRelation (Relation _ store@TupleStore{})) = not (all (`M.member` TStore.storeIndexes store) keys)
+lacksKeyIndexes _ _ = False
+
+-- | 'ensureKeyIndexes' for all relation variables.
+ensureAllKeyIndexes :: InclusionDependencies -> RelationVariables -> RelationVariables
+ensureAllKeyIndexes incDeps relVars = M.foldrWithKey addIndexes relVars (keysForInclusionDependencies incDeps)
+  where
+    addIndexes relVarName keys rvs =
+      case M.lookup relVarName rvs of
+        Just expr | lacksKeyIndexes keys expr -> M.insert relVarName (addKeyIndexes keys expr) rvs
+        _ -> rvs
+
+-- | Set a relation variable to a materialized relation. Unlike 'setRelVar', there is nothing to resolve since the expression is a value.
+setMaterializedRelVar :: RelVarName -> GraphRefRelationalExpr -> DatabaseContextEvalMonad ()
+setMaterializedRelVar relVarName relExpr = do
+  currentContext <- getStateContext
+  graph <- dbcGraph
+  relVars <- resolveDBC relationVariables
+  incDeps <- resolveDBC inclusionDependencies
+  let potentialContext = currentContext { relationVariables = ValueMarker (M.insert relVarName (ensureKeyIndexes incDeps relVarName relExpr) relVars) }
+  tid <- dbcTransId
+  case checkConstraintsMentioning (Just relVarName) potentialContext tid graph of
+    Left err -> dbErr err
+    Right _ -> putStateContext potentialContext
+
+-- | Relational expressions which denote a relation value by themselves.
+isConstantRelationalExpr :: GraphRefRelationalExpr -> Bool
+isConstantRelationalExpr MakeStaticRelation{} = True
+isConstantRelationalExpr ExistingRelation{} = True
+isConstantRelationalExpr MakeRelationFromExprs{} = True
+isConstantRelationalExpr _ = False
+
+-- | Evaluate the expression against the current (uncommitted) state.
+evalRelationalExprNow :: GraphRefRelationalExpr -> DatabaseContextEvalMonad (Either RelationalError Relation)
+evalRelationalExprNow expr = do
+  graph <- dbcGraph
+  context <- getStateContext
+  pure (runGraphRefRelationalExprM (freshGraphRefRelationalExprEnv (Just context) graph) (evalGraphRefRelationalExpr expr))
+
+-- | The value of a relation variable as a materialized relation, for the statements which change a relation variable in place. If the relation variable is still defined by an expression (after an assignment such as @x := y join z@, or a merge), the expression is evaluated here, so that the first change materializes the relation variable and later ones are cheap. Nothing if it cannot be evaluated.
+materializedRelVarValue :: GraphRefRelationalExpr -> DatabaseContextEvalMonad (Maybe Relation)
+materializedRelVarValue (ExistingRelation rel) = pure (TStore.materializeRelation rel)
+materializedRelVarValue expr = do
+  eRel <- evalRelationalExprNow expr
+  pure (either (const Nothing) TStore.materializeRelation eRel)
+
+-- | The tuples of a materialized relation (the second argument must be a 'TupleStore') which satisfy the predicate. If the predicate compares indexed attributes with constants, only the tuples found through the index are examined.
+matchingStoreTuples :: Attributes -> RelationTupleSet -> GraphRefRestrictionPredicateExpr -> DatabaseContextEvalMonad (Either RelationalError [RelationTuple])
+matchingStoreTuples attrs store predicate = do
+  graph <- dbcGraph
+  context <- getStateContext
+  let env = freshGraphRefRelationalExprEnv (Just context) graph
+      candidates = fromMaybe (asList store) (TStore.storeLookupByEqualities (TStore.predicateEqualities predicate) store)
+  pure $ do
+    rfilter <- runGraphRefRelationalExprM env (predicateRestrictionFilter attrs predicate)
+    filterM (`rfilter` mempty) candidates
+
+-- | A constant relational expression is stored as a materialized relation so that later inserts are applied to the value instead of piling up as an ever-growing expression.
+materializeIfConstant :: GraphRefRelationalExpr -> DatabaseContextEvalMonad GraphRefRelationalExpr
+materializeIfConstant expr
+  | isConstantRelationalExpr expr = do
+      eRel <- evalRelationalExprNow expr
+      pure $ case eRel of
+        Right rel | Just materialized <- TStore.materializeRelation rel -> ExistingRelation materialized
+        _ -> expr
+  | otherwise = pure expr
+
+-- | When the previous value of a relation variable is a relation (rather than an expression yet to be evaluated), evaluate its replacement right away and keep it materialized (with the same indexes). If the replacement cannot be evaluated, it is kept as an expression as before.
+rematerialize :: GraphRefRelationalExpr -> GraphRefRelationalExpr -> DatabaseContextEvalMonad GraphRefRelationalExpr
+rematerialize (ExistingRelation (Relation _ previous)) newExpr = do
+  eRel <- evalRelationalExprNow newExpr
+  pure $ case eRel of
+    Right rel | Just materialized <- TStore.materializeRelationLike previous rel -> ExistingRelation materialized
+    _ -> newExpr
+rematerialize _ newExpr = pure newExpr
 
 --fast-path insertion- we already know that the previous relvar validated correctly, so we can validate just the relation that is being inserted for attribute matches- without this, even a single tuple relation inserted causes the entire relation to be re-validated unnecessarily
 --insertIntoRelVar :: RelVarName -> GraphRefRelationalExpr -> DatabaseContextEvalMonad ()
@@ -292,7 +386,7 @@ deleteRelVar relVarName = do
     let newRelVars = ValueMarker $ M.delete relVarName relVars
         newContext = currContext { relationVariables = newRelVars }
     tid <- dbcTransId
-    case checkConstraints newContext tid graph of
+    case checkConstraintsMentioning (Just relVarName) newContext tid graph of
       Left err -> dbErr err
       Right _ ->
         putStateContext newContext
@@ -317,7 +411,7 @@ evalGraphRefDatabaseContextExpr (Define relVarName attrExprs) = do
           False -> setRelVar relVarName (ExistingRelation emptyRelation)
             where
               attrs = A.attributesFromList attrsList
-              emptyRelation = Relation attrs TS.empty
+              emptyRelation = Relation attrs (TStore.emptyStore attrs)
 
 evalGraphRefDatabaseContextExpr (Undefine relVarName) = deleteRelVar relVarName
 
@@ -334,7 +428,7 @@ evalGraphRefDatabaseContextExpr (Assign relVarName expr) = do
         Left err -> dbErr err
         Right reltype -> do
           lift $ except $ validateAttributes tConsMapping (attributes reltype)
-          setRelVar relVarName expr
+          setRelVar relVarName =<< materializeIfConstant expr
     Just existingRel -> do
       let eExpectedType = runGraphRefRelationalExprM reEnv (typeForGraphRefRelationalExpr existingRel)
       case eExpectedType of
@@ -347,21 +441,50 @@ evalGraphRefDatabaseContextExpr (Assign relVarName expr) = do
             Right newExprType -> do
               if newExprType == expectedType then do
                 lift $ except $ validateAttributes tConsMapping (attributes newExprType)
-                setRelVar relVarName expr
+                setRelVar relVarName =<< materializeIfConstant expr
               else do
                 dbErr (RelationTypeMismatchError (attributes expectedType) (attributes newExprType))
 
 evalGraphRefDatabaseContextExpr (Insert relVarName relExpr) = do
   gfExpr <- relVarByName relVarName
-  let optExpr = applyUnionCollapse (Union
-                                    relExpr
-                                     gfExpr)
-  evalGraphRefDatabaseContextExpr (Assign relVarName optExpr)
+  -- fast path: evaluate the inserted relation and add its tuples to the (materialized) value of the relation variable. This takes time proportional to the inserted tuples and the new value shares the rest with the old one.
+  mBase <- materializedRelVarValue gfExpr
+  mInserted <- case mBase of
+    Just (Relation attrs store) -> do
+      eDelta <- evalRelationalExprNow relExpr
+      pure $ case eDelta of
+        Right (Relation deltaAttrs deltaTups)
+          | A.attributeNameSet deltaAttrs == A.attributeNameSet attrs && A.attributesEqual deltaAttrs attrs -> do
+              newStore <- TStore.storeInsertTupleSet store deltaTups
+              pure (TStore.storeSize newStore /= TStore.storeSize store, ExistingRelation (Relation attrs newStore))
+        _ -> Nothing
+    Nothing -> pure Nothing
+  case mInserted of
+    Just (changed, newExpr) -> when changed (setMaterializedRelVar relVarName newExpr)
+    Nothing -> do
+      let optExpr = applyUnionCollapse (Union
+                                        relExpr
+                                        gfExpr)
+      evalGraphRefDatabaseContextExpr (Assign relVarName optExpr)
 
 evalGraphRefDatabaseContextExpr (Delete relVarName predicate) = do
   gfExpr <- relVarByName relVarName
-  let optExpr = applyRestrictionCollapse (Restrict (NotPredicate predicate) gfExpr)
-  setRelVar relVarName optExpr
+  -- fast path: the relation variable is a materialized relation. Find the tuples to delete (through an index if the predicate allows) and remove them from the existing value.
+  mBase <- materializedRelVarValue gfExpr
+  mDeleted <- case mBase of
+    Just (Relation attrs store) -> do
+      eMatching <- matchingStoreTuples attrs store predicate
+      pure $ case eMatching of
+        Right [] -> Just Nothing
+        Right matching -> Just (Just (ExistingRelation (Relation attrs (TStore.storeDeleteVectors store (map tupleAtoms matching)))))
+        Left _ -> Nothing
+    Nothing -> pure Nothing
+  case mDeleted of
+    Just Nothing -> pure () -- no tuple matches
+    Just (Just newExpr) -> setMaterializedRelVar relVarName newExpr
+    Nothing -> do
+      let optExpr = applyRestrictionCollapse (Restrict (NotPredicate predicate) gfExpr)
+      setRelVar relVarName =<< rematerialize gfExpr optExpr
   
 --union of restricted+updated portion and the unrestricted+unupdated portion
 evalGraphRefDatabaseContextExpr (Update relVarName atomExprMap pred') = do
@@ -386,24 +509,51 @@ evalGraphRefDatabaseContextExpr (Update relVarName atomExprMap pred') = do
       updateAttr nam atomExpr = Extend (AttributeExtendTupleExpr (tmpAttr nam) atomExpr)
       projectAndRename attr expr = Rename (S.singleton (tmpAttr attr, attr)) (Project (InvertedAttributeNames (S.singleton attr)) expr)
       restrictedPortion = Restrict pred' rvExpr
-      updated = foldr (\(oldname, atomExpr) accum ->
+      updated restricted = foldr (\(oldname, atomExpr) accum ->
                                  let procAtomExpr = runProcessExprM UncommittedContextMarker (processAtomExpr atomExpr) in
                                   updateAttr oldname procAtomExpr accum
-                              ) restrictedPortion (M.toList atomExprMap)
+                              ) restricted (M.toList atomExprMap)
               -- the atomExprMap could reference other attributes, so we must perform multi-pass folds
-      updatedPortion = foldr projectAndRename updated (M.keys atomExprMap)
-  setRelVar relVarName (Union unrestrictedPortion updatedPortion)
+      updatedPortionOf restricted = foldr projectAndRename (updated restricted) (M.keys atomExprMap)
+  -- fast path: the relation variable is a materialized relation. Find the tuples to update (through an index if the predicate allows), compute their replacements, and swap them in the existing value. The cost depends on the number of updated tuples and the new value shares the rest with the old one.
+  mBase <- materializedRelVarValue rvExpr
+  mUpdated <- case mBase of
+    Just (Relation attrs store) -> do
+      eMatching <- matchingStoreTuples attrs store pred'
+      case eMatching of
+        Right [] -> pure (Just Nothing)
+        Right matching -> do
+          eReplacements <- evalRelationalExprNow (updatedPortionOf (ExistingRelation (Relation attrs (RelationTupleSet matching))))
+          pure $ case eReplacements of
+            Right (Relation replacementAttrs replacements)
+              | A.attributeNameSet replacementAttrs == A.attributeNameSet attrs && A.attributesEqual replacementAttrs attrs ->
+                  Just . ExistingRelation . Relation attrs <$> TStore.storeInsertTupleSet (TStore.storeDeleteVectors store (map tupleAtoms matching)) replacements
+            _ -> Nothing
+        Left _ -> pure Nothing
+    Nothing -> pure Nothing
+  case mUpdated of
+    Just Nothing -> pure () -- no tuple matches
+    Just (Just newExpr) -> setMaterializedRelVar relVarName newExpr
+    Nothing -> setRelVar relVarName =<< rematerialize rvExpr (Union unrestrictedPortion (updatedPortionOf restrictedPortion))
 
 evalGraphRefDatabaseContextExpr (AddInclusionDependency newDepName newDep) = do
   currContext <- getStateContext
   transId <- dbcTransId
   graph <- dbcGraph
   currDeps <- resolveDBC inclusionDependencies
+  relVars <- resolveDBC relationVariables
   let newDeps = ValueMarker $ M.insert newDepName newDep currDeps
   if M.member newDepName currDeps then
     dbErr (InclusionDependencyNameInUseError newDepName)
     else do
-      let potentialContext = currContext { inclusionDependencies = newDeps }
+      -- a key gets an index on its relation variable right away so that it is checked through the index from now on
+      let potentialContext = case keyForInclusionDependency newDep of
+            Just (rvName, _) | Just rvExpr <- M.lookup rvName relVars, isMaterializedStore rvExpr ->
+                               currContext { inclusionDependencies = newDeps,
+                                             relationVariables = ValueMarker (M.insert rvName (ensureKeyIndexes (M.singleton newDepName newDep) rvName rvExpr) relVars) }
+            _ -> currContext { inclusionDependencies = newDeps }
+          isMaterializedStore (ExistingRelation (Relation _ TupleStore{})) = True
+          isMaterializedStore _ = False
       -- if the potential context passes all constraints, then save it
       -- potential optimization: validate only the new constraint- all old constraints must already hold
       case checkConstraints potentialContext transId graph of
@@ -756,8 +906,15 @@ evalGraphRefDatabaseContextIOExpr (LoadModuleWithFunctions moduleBody) = do
 -- | run verification of all constraints
 -- needs DatabaseContext to create dummy Transaction
 checkConstraints :: DatabaseContext -> TransactionId -> TransactionGraph -> Either RelationalError ()
-checkConstraints context transId graph@(TransactionGraph graphHeads transSet) = do
-  deps <- resolveDBC' graph context inclusionDependencies  
+checkConstraints = checkConstraintsMentioning Nothing
+
+-- | Verify the constraints. If a relation variable is given, it is the only relation variable which has changed since the constraints were last verified, so only the inclusion dependencies which mention it are evaluated again: the others cannot have been affected.
+checkConstraintsMentioning :: Maybe RelVarName -> DatabaseContext -> TransactionId -> TransactionGraph -> Either RelationalError ()
+checkConstraintsMentioning mChangedRelVar context transId graph@(TransactionGraph graphHeads transSet) = do
+  allDeps <- resolveDBC' graph context inclusionDependencies
+  let deps = case mChangedRelVar of
+        Nothing -> allDeps
+        Just changedRelVar -> M.filter (\(InclusionDependency subExpr superExpr) -> S.member changedRelVar (relVarsMentioned subExpr) || S.member changedRelVar (relVarsMentioned superExpr)) allDeps
   mapM_ (uncurry checkIncDep) (M.toList deps)
   regQueries <- resolveDBC' graph context registeredQueries
   mapM_ checkRegisteredQuery (M.toList regQueries)
@@ -777,6 +934,13 @@ checkConstraints context transId graph@(TransactionGraph graphHeads transSet) = 
     process = runProcessExprM UncommittedContextMarker
     gfEnv = freshGraphRefRelationalExprEnv (Just context) graph
       -- no optimization available here, really? perhaps the optimizer should be passed down to here or the eval function should be passed through the environment
+    -- a key over a materialized relation variable with an index on the key attributes: the index knows whether the attributes are unique
+    checkIncDep depName incDep
+      | Just (rvName, keyNames) <- keyForInclusionDependency incDep,
+        Right relVars <- resolveDBC' graph context relationVariables,
+        Just (ExistingRelation (Relation _ store)) <- M.lookup rvName relVars,
+        Just unique <- TStore.storeIsUnique keyNames store =
+          if unique then pure () else Left (InclusionDependencyCheckError depName Nothing)
     checkIncDep depName (InclusionDependency subsetExpr supersetExpr) = do
       let gfSubsetExpr = process (processRelationalExpr subsetExpr)
           gfSupersetExpr = process (processRelationalExpr supersetExpr)
@@ -1321,11 +1485,13 @@ transactionForId tid graph
   | tid == U.nil =
     Left RootTransactionTraversalError
   | otherwise =
-      let sameTID (Transaction idMatch _ _) = idMatch == tid
-          matchingTrans = S.filter sameTID $ transactionsForGraph graph
-      in  case S.toList matchingTrans of
-        [] -> Left $ NoSuchTransactionError tid
-        x : _ -> Right x
+      -- transactions are ordered by their id alone, so a probe which carries only the id finds the transaction without scanning the set
+      case S.lookupGE (Transaction tid probe probe) (transactionsForGraph graph) of
+        Just trans | transactionId trans == tid -> Right trans
+        _ -> Left $ NoSuchTransactionError tid
+  where
+    probe :: a
+    probe = error "transactionForId: probe field forced"
 
 typeForGraphRefRelationalExpr :: GraphRefRelationalExpr -> GraphRefRelationalExprM Relation
 typeForGraphRefRelationalExpr = typeForGraphRefRelationalExpr' Nothing

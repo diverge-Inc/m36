@@ -1,4 +1,4 @@
-{-# LANGUAGE ExistentialQuantification,DeriveGeneric,DeriveAnyClass,FlexibleInstances,OverloadedStrings, DeriveTraversable, DerivingVia, TemplateHaskell, TypeFamilies, BangPatterns, DuplicateRecordFields #-}
+{-# LANGUAGE ExistentialQuantification,DeriveGeneric,DeriveAnyClass,FlexibleInstances,OverloadedStrings, DeriveTraversable, DerivingVia, TemplateHaskell, TypeFamilies, BangPatterns, DuplicateRecordFields, PatternSynonyms, ViewPatterns, MagicHash #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module ProjectM36.Base where
@@ -7,6 +7,8 @@ import ProjectM36.AccessControlList
 import Data.Functor.Foldable.TH
 import qualified Data.Map as M
 import qualified Data.HashSet as HS
+import qualified Data.HashMap.Strict as HM
+import GHC.Exts (reallyUnsafePtrEquality#, isTrue#)
 import Data.Hashable (Hashable, hashWithSalt)
 import qualified Data.Set as S
 import Data.UUID (UUID)
@@ -145,7 +147,54 @@ sortedAttributesIndices :: Attributes -> [(Int, Attribute)]
 sortedAttributesIndices attrs = L.sortBy (\(_, Attribute name1 _) (_,Attribute name2 _) -> compare name1 name2) $ V.toList (V.indexed (attributesVec attrs))
 
 -- | The relation's tuple set is the body of the relation.
-newtype RelationTupleSet = RelationTupleSet { asList :: [RelationTuple] } deriving (Show, Generic, Read)
+--
+-- There are two representations:
+--
+-- * 'TupleList' is a plain list of tuples. It is what relational operators produce and consume.
+-- * 'TupleStore' is the materialized form used for the value of a relation variable. The tuples are kept as atom vectors (all in the attribute order of the store) in a persistent hash set, so that a new version of the relation variable shares structure with the previous one and inserting a few tuples does not cost time or space proportional to the size of the relation.
+--
+-- The 'RelationTupleSet' pattern (with its 'asList' field) presents both as a list so that code which does not care about the representation is unaffected.
+data RelationTupleSet = TupleList [RelationTuple]
+                      | TupleStore !Attributes !Int !(HS.HashSet (V.Vector Atom)) !TupleStoreIndexes
+                        -- ^ attributes (fixing the atom order), number of tuples, the tuples, unique-key indexes
+
+pattern RelationTupleSet :: [RelationTuple] -> RelationTupleSet
+pattern RelationTupleSet { asList } <- (tupleSetAsList -> asList)
+  where RelationTupleSet tups = TupleList tups
+{-# COMPLETE RelationTupleSet #-}
+
+tupleSetAsList :: RelationTupleSet -> [RelationTuple]
+tupleSetAsList (TupleList tups) = tups
+tupleSetAsList (TupleStore attrs _ tups _) = map (RelationTuple attrs) (HS.toList tups)
+
+-- | Indexes of a 'TupleStore', keyed by the names of the indexed attributes.
+type TupleStoreIndexes = M.Map (S.Set AttributeName) TupleStoreIndex
+
+-- | An index over a subset of the attributes of a 'TupleStore'. It serves both to find tuples by the indexed attributes and to tell cheaply whether the indexed attributes are a key (no two tuples agree on them).
+data TupleStoreIndex = TupleStoreIndex {
+  tsiPositions :: !(V.Vector Int), -- ^ positions of the indexed attributes in the atom vectors of the store, in ascending order of attribute name
+  tsiMap :: !(HM.HashMap (V.Vector Atom) [V.Vector Atom]), -- ^ indexed atoms to the tuples carrying them
+  tsiDuplicates :: !Int -- ^ number of entries with more than one tuple; zero if and only if the indexed attributes are unique
+  }
+
+-- | Pointer equality; 'True' implies that both arguments are the same value, 'False' implies nothing.
+ptrEquals :: a -> a -> Bool
+ptrEquals a b = isTrue# (reallyUnsafePtrEquality# a b)
+{-# INLINE ptrEquals #-}
+
+-- same output format as the instance derived for the former newtype
+instance Show RelationTupleSet where
+  showsPrec d tupSet = showParen (d >= 11) $
+    showString "RelationTupleSet {asList = " . showsPrec 0 (asList tupSet) . showString "}"
+
+instance Read RelationTupleSet where
+  readsPrec d = readParen (d > 11) $ \s ->
+    [(TupleList tups, rest) | ("RelationTupleSet", s1) <- lex s,
+                              ("{", s2) <- lex s1,
+                              ("asList", s3) <- lex s2,
+                              ("=", s4) <- lex s3,
+                              (tups, s5) <- readsPrec 0 s4,
+                              ("}", rest) <- lex s5]
 
 -- we cannot derive Hashable for tuplesets; we need to hash the unordered set of tuples
 instance Hashable RelationTupleSet where
@@ -155,11 +204,16 @@ instance Read Relation where
   readsPrec = error "relation read not supported"
 
 instance Eq RelationTupleSet where
+ TupleStore attrs1 size1 tups1 _ == TupleStore attrs2 size2 tups2 _
+   | attributesVec attrs1 == attributesVec attrs2 = size1 == size2 && (ptrEquals tups1 tups2 || tups1 == tups2)
  set1 == set2 = hset set1 == hset set2
    where
      hset = HS.fromList . asList
 
-instance NFData RelationTupleSet where rnf = genericRnf
+instance NFData RelationTupleSet where
+  rnf (TupleList tups) = rnf tups
+  -- the atom vectors of a store are evaluated when they are hashed on insertion, so there is nothing left to force (and walking a large store on every deep evaluation would defeat its purpose)
+  rnf (TupleStore attrs size _ _) = rnf attrs `seq` rnf size
 
 --the same hash must be generated for equal tuples so that the hashset equality works
 instance Hashable RelationTuple where
@@ -195,7 +249,14 @@ data Relation = Relation Attributes RelationTupleSet deriving (Show, Generic,Typ
 instance Eq Relation where
   Relation attrs1 tupSet1 == Relation attrs2 tupSet2 = attrs1 == attrs2 && tupSet1 == tupSet2
 
-instance NFData Relation where rnf = genericRnf
+-- the tuples of a relation normally all point to the attributes of the relation; those are forced once instead of once per tuple
+instance NFData Relation where
+  rnf (Relation !attrs (TupleList tups)) = rnf attrs `seq` go tups
+    where
+      -- (the bangs make sure that the pointers which are compared are those of the evaluated attributes)
+      go [] = ()
+      go (RelationTuple !tupAttrs atoms : rest) = (if ptrEquals tupAttrs attrs then () else rnf tupAttrs) `seq` rnf atoms `seq` go rest
+  rnf (Relation attrs store@TupleStore{}) = rnf attrs `seq` rnf store
                                
 instance Hashable Relation where                               
   hashWithSalt salt (Relation attrs tupSet) = salt `hashWithSalt` 

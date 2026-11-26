@@ -25,7 +25,6 @@ extra-deps:
   - ech-config-0.0.1
   - hpke-0.0.0
   - zlib-0.7.1.1
-  - linux-xattr-0.1.1.0
   - crypto-token-0.1.2
   - tls-session-manager-0.0.8
   - auto-update-0.2.6
@@ -55,6 +54,5 @@ allow-newer: true
 allow-newer-deps:
   - unicode-data
   - aeson
-  - linux-xattr
   - crypton-connection
   - warp-tls

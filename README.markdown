@@ -5,7 +5,7 @@
 *Software can always be made faster, but rarely can it be made more correct.*
 
 > [!NOTE]
-> This is diverge's fork of [agentm/project-m36](https://github.com/agentm/project-m36). It tracks upstream and differs mainly in packaging: it is a Nix flake built on nixpkgs' default GHC (currently 9.10), with dependency bounds aligned to the versions in nixpkgs. See [Changelog](Changelog.markdown) for the fork-specific changes.
+> This is diverge's fork of [agentm/project-m36](https://github.com/agentm/project-m36). It differs from upstream in two ways. Packaging: it is a Nix flake built on nixpkgs' default GHC (currently 9.10), with dependency bounds aligned to the versions in nixpkgs. Storage: commits are appended to a transaction log as changes, relation variables are kept as materialized relations with indexes for their keys, and the cost of a commit no longer grows with the database or its history ([measurements against PostgreSQL](docs/append_benchmark.markdown)). The on-disk format is not compatible with upstream's. See [Changelog](Changelog.markdown) for the fork-specific changes.
 
 ## Introduction
 

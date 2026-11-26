@@ -75,7 +75,9 @@ deriving instance Lift a => Lift (RestrictionPredicateExprBase a)
 deriving instance Lift a => Lift (ExtendTupleExprBase a)
 deriving instance Lift a => Lift (WithNameExprBase a)
 deriving instance Lift a => Lift (AtomExprBase a)
-deriving instance Lift RelationTupleSet
+-- a tuple set is lifted as its list of tuples whichever its representation
+instance Lift RelationTupleSet where
+  liftTyped tupSet = [|| TupleList $$(liftTyped (asList tupSet)) ||]
 deriving instance Lift Attributes
 deriving instance Lift Relation
 deriving instance Lift TypeConstructor
